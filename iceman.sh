@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS - ICE-GNOME-ULTRA (v5.0 - THE DEFINITIVE MASTERPIECE)
-# Arquitectura: Clean Room (Host -> Chroot Inyectado)
-# Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | CachyOS Kernel
-# Contenido: 100% Core + 100% User-Space Apps + Bazzite-like Gaming
+# ICEMAN OS - ICE-GNOME-ULTRA (v5.1 - ADAPTIVE MASTERPIECE)
+# Arquitectura: Clean Room + Hardware Awareness (Metal vs VM)
+# Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | VirtualBox Safe Mode
+# Contenido: 100% Core + 100% User-Space Apps + Gaming Sysctl
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -14,6 +14,7 @@ LOG_FILE="/tmp/iceman_ultra_install.log"
 # --- Funciones de Interfaz ---
 print_info() { echo -e "\033[1;36m[i] $1\033[0m"; }
 print_success() { echo -e "\033[1;32m[✓] $1\033[0m"; }
+print_warning() { echo -e "\033[1;33m[!] $1\033[0m"; }
 print_error() { 
     echo -e "\n\033[1;31m[!] FATAL ERROR: $1\033[0m"
     tail -n 20 "$LOG_FILE"
@@ -30,23 +31,45 @@ run() {
     fi
 }
 
-# ==============================================================================
-# FASE 1: RECOPILACIÓN DE DATOS E INFRAESTRUCTURA (HOST)
-# ==============================================================================
 clear
 echo -e "\033[1;36m==============================================================\033[0m"
 echo -e "\033[1;36m          ICEMAN OS - ICE GNOME ULTRA DEPLOYMENT              \033[0m"
 echo -e "\033[1;36m==============================================================\033[0m\n"
 
+# ==============================================================================
+# FASE 0: INTELIGENCIA DE ENTORNO (Hardware Awareness)
+# ==============================================================================
+print_info "Iniciando escaneo de topología de hardware..."
+IS_VM=$(systemd-detect-virt 2>/dev/null || echo "none")
+
+if [[ "$IS_VM" == "none" ]]; then
+    print_success "MODO METAL DETECTADO: Perfil 'Ryzen 9 / RX 7600 XT' Activado."
+    OPT_PARALLEL_DL="15"
+    OPT_MAKEFLAGS="-j$(nproc)"
+    OPT_BTRFS="compress=zstd:3,ssd,discard=async,space_cache=v2"
+    OPT_KERNEL="quiet splash loglevel=3 amdgpu.ppfeaturemask=0xffffffff amd_pstate=active apparmor=1 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
+    OPT_SECUREBOOT="YES"
+else
+    print_warning "ENTORNO VIRTUAL DETECTADO ($IS_VM): Perfil 'Safe Mode' Activado."
+    print_warning "-> Reduciendo concurrencia I/O y mitigando RCU Stalls."
+    OPT_PARALLEL_DL="4"
+    OPT_MAKEFLAGS="-j2"
+    OPT_BTRFS="compress=zstd:1,ssd,space_cache=v2"
+    OPT_KERNEL="quiet splash loglevel=3 rcu_cpu_stall_timeout=60 apparmor=1 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
+    OPT_SECUREBOOT="NO"
+fi
+echo ""
+
 timedatectl set-ntp true
 
-# Selección de Hardware
+# ==============================================================================
+# FASE 1: RECOPILACIÓN DE DATOS E INFRAESTRUCTURA (HOST)
+# ==============================================================================
 mapfile -t DISKS < <(lsblk -d -n -p -o NAME,SIZE,MODEL | grep -v "loop")
 for i in "${!DISKS[@]}"; do echo "  $((i+1))) ${DISKS[$i]}"; done
 read -p "➤ Selecciona disco de instalación [1]: " D_SEL; D_SEL=${D_SEL:-1}
 TARGET_DISK=$(echo "${DISKS[$((D_SEL-1))]}" | awk '{print $1}')
 
-# Credenciales y Seguridad
 read -p "➤ ¿Cifrar disco con LUKS2 (Argon2id)? (s/N): " ANS_LUKS
 if [[ "${ANS_LUKS,,}" == "s" ]]; then
     USE_LUKS="YES"
@@ -67,10 +90,8 @@ fi
 read -p "➤ Usuario [iceman]: " USERNAME; USERNAME=${USERNAME:-iceman}
 read -p "➤ Hostname [iceman-pc]: " HOSTNAME_PC; HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
 
-# Enlaces a los Assets
 CURSOR_URL="https://github.com/vinceliuice/Qogir-icon-theme/archive/refs/tags/2023-06-05.tar.gz"
 GRUB_THEME_URL="https://github.com/yeyushengfan258/Particle-circle-grub-theme/archive/refs/heads/main.tar.gz"
-
 RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | head -n 1 || echo "1920x1080")
 GRUB_GFXMODE="${RAW_RES}x32"
 
@@ -104,7 +125,7 @@ run "Estructurando subvolúmenes BTRFS" "
 "
 
 run "Montando árbol final BTRFS" "
-    B_OPTS='rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2'
+    B_OPTS='rw,noatime,$OPT_BTRFS'
     mount -o \$B_OPTS,subvol=@ $M_ROOT /mnt
     mkdir -p /mnt/{boot/efi,home,var/log,var/cache/pacman/pkg,var/cache,.snapshots}
     mount -o \$B_OPTS,subvol=@home $M_ROOT /mnt/home
@@ -115,19 +136,28 @@ run "Montando árbol final BTRFS" "
     mount $P_EFI /mnt/boot/efi
 "
 
-# 1.4 Repositorios y Sistema Base (Pacstrap)
-run "Configurando repositorios CachyOS en Host" "
-    pacman -Sy --noconfirm archlinux-keyring cachyos-keyring
+# 1.4 Repositorios Seguros y Sistema Base (Pacstrap)
+run "Configurando Pacman en Host (Modo Seguro)" "
+    sed -i \"s/^#ParallelDownloads.*/ParallelDownloads = $OPT_PARALLEL_DL/\" /etc/pacman.conf
+    pacman-key --init
+    pacman-key --populate archlinux
+"
+
+run "Inyectando repositorios CachyOS" "
+    pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
+    pacman-key --lsign-key F3B607488DB35A47
+    pacman -U 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst' 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-18-1-any.pkg.tar.zst' --noconfirm
     sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf || true
-    printf '\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n' >> /etc/pacman.conf
+    printf '\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' >> /etc/pacman.conf
     pacman -Sy
 "
 
-CORE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode cachyos-keyring cachyos-mirrorlist cachyos-settings cachyos-hooks btrfs-progs btrfsmaintenance networkmanager git nano vim wget curl sudo zram-generator ufw apparmor grub efibootmgr os-prober plymouth plymouth-theme-spinner snapper snap-pac grub-btrfs inotify-tools sbctl"
+CORE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode cachyos-keyring cachyos-mirrorlist cachyos-settings cachyos-hooks btrfs-progs btrfsmaintenance networkmanager git nano vim wget curl sudo zram-generator ufw apparmor grub efibootmgr os-prober plymouth plymouth-theme-spinner snapper snap-pac grub-btrfs inotify-tools"
 FS_PKGS="ntfs-3g exfatprogs dosfstools mtools fuse3 unzip p7zip rsync"
 [[ "$USE_LUKS" == "YES" ]] && CORE_PKGS="$CORE_PKGS cryptsetup"
+[[ "$OPT_SECUREBOOT" == "YES" ]] && CORE_PKGS="$CORE_PKGS sbctl"
 
-run "Inyectando Sistema Base (Pacstrap)" "pacstrap -K /mnt $CORE_PKGS $FS_PKGS"
+run "Instalando Sistema Base (Pacstrap)" "pacstrap -K /mnt $CORE_PKGS $FS_PKGS"
 
 run "Generando fstab y crypttab" "
     genfstab -U /mnt >> /mnt/etc/fstab
@@ -137,7 +167,7 @@ run "Generando fstab y crypttab" "
 # ==============================================================================
 # FASE 2: CONSTRUCCIÓN DEL ENTORNO 'CLEAN ROOM' (EL MOTOR CHROOT)
 # ==============================================================================
-print_info "Ensamblando motor de configuración interna (Arquitectura Aislada)..."
+print_info "Ensamblando motor interno en Chroot Aislado..."
 
 cat << EOF > /mnt/root/install_vars.sh
 USERNAME="$USERNAME"
@@ -147,19 +177,23 @@ USE_LUKS="$USE_LUKS"
 GRUB_GFXMODE="$GRUB_GFXMODE"
 CURSOR_URL="$CURSOR_URL"
 GRUB_THEME_URL="$GRUB_THEME_URL"
+OPT_PARALLEL_DL="$OPT_PARALLEL_DL"
+OPT_MAKEFLAGS="$OPT_MAKEFLAGS"
+OPT_KERNEL="$OPT_KERNEL"
+OPT_SECUREBOOT="$OPT_SECUREBOOT"
 EOF
 
 cat << 'CHROOT_EOF' > /mnt/root/install_internal.sh
 #!/bin/bash
 set -Eeuo pipefail
 source /root/install_vars.sh
-export MAKEFLAGS="-j$(nproc)"
+export MAKEFLAGS="$OPT_MAKEFLAGS"
 
 # A. OPTIMIZACIÓN DE PACMAN Y REPOS
 sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf
 echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
 sed -i 's/^#Color/Color\nILoveCandy/' /etc/pacman.conf
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
+sed -i "s/^#ParallelDownloads.*/ParallelDownloads = $OPT_PARALLEL_DL/" /etc/pacman.conf
 pacman -Sy --noconfirm
 
 # B. LOCALIZACIÓN
@@ -179,7 +213,6 @@ echo "$USERNAME:$MASTER_PASS" | chpasswd
 echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-wheel
 
 cat << 'ENV_VARS' >> /etc/environment
-# Forzar Electron/Chromium en Wayland Nativo
 ELECTRON_OZONE_PLATFORM_HINT=auto
 MOZ_ENABLE_WAYLAND=1
 ENV_VARS
@@ -187,11 +220,11 @@ ENV_VARS
 # D. INSTALACIÓN DE MÓDULOS (AMD, UI, Multimedia Pro)
 PACMAN_CMD="pacman -S --needed --noconfirm"
 
-# D.1 Drivers AMD y Multimedia (GStreamer Full)
+# D.1 Drivers Base (Siempre instalamos AMD para mantener el disco portable al Metal)
 $PACMAN_CMD xf86-video-amdgpu mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver
 $PACMAN_CMD pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav bluez bluez-utils
 
-# D.2 Audio Low-Latency (Pro Audio Bazzite-like)
+# D.2 Audio Low-Latency
 mkdir -p /etc/pipewire/pipewire.conf.d
 cat << 'PIPEWIRE' > /etc/pipewire/pipewire.conf.d/92-low-latency.conf
 context.properties = {
@@ -206,21 +239,18 @@ PIPEWIRE
 $PACMAN_CMD gnome gnome-tweaks gdm xdg-desktop-portal-gnome firefox gnome-shell-extension-dash-to-dock gnome-shell-extension-appindicator flatpak
 flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
 
-# D.4 Gaming Bazzite-Like
+# D.4 Gaming
 $PACMAN_CMD steam steam-native-runtime lutris wine-staging winetricks gamemode lib32-gamemode corectrl mangohud vkbasalt ananicy-cpp
 
-# E. COMPILACIÓN AUR Y GESTIÓN (THE MISSING PIECES RESTORED)
+# E. COMPILACIÓN AUR Y GESTIÓN
 sudo -u "$USERNAME" bash -c "cd /tmp && git clone --depth=1 https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm"
 
-# E.1 Herramientas de Gestión Gráfica y Productividad
 sudo -u "$USERNAME" yay -S --noconfirm pamac-aur libpamac-flatpak-plugin btrfs-assistant mission-center stacer-bin onlyoffice-bin extension-manager ttf-ms-fonts
-
-# E.2 Drivers de Mandos Xbox/PS, Extensiones y Temas Visuales
 sudo -u "$USERNAME" yay -S --noconfirm xone-dkms xpadneo-dkms input-remapper-git \
     adw-gtk3-git papirus-icon-theme qogir-cursor-theme \
     gnome-shell-extension-blur-my-shell gnome-shell-extension-vitals
 
-# F. BLINDAJE Y RENDIMIENTO (UFW, AppArmor, ZRAM)
+# F. BLINDAJE Y RENDIMIENTO
 ufw default deny incoming
 ufw default allow outgoing
 cat << 'ZRAM' > /etc/systemd/zram-generator.conf
@@ -229,24 +259,22 @@ zram-size = ram / 2
 compression-algorithm = zstd
 ZRAM
 
-# F.2 Auto-Limpieza de Shaders (Mantenimiento Automático)
+# F.2 Auto-Limpieza de Shaders
 cat << 'SHADERS_SH' > /usr/local/bin/clean-shaders.sh
 #!/bin/bash
 find /home/*/.cache/mesa_shader_cache -type f -atime +30 -delete 2>/dev/null || true
 SHADERS_SH
 chmod +x /usr/local/bin/clean-shaders.sh
-
 cat << 'SHADERS_SRV' > /etc/systemd/system/clean-shaders.service
 [Unit]
-Description=Limpieza de Cache de Shaders AMD
+Description=Limpieza Cache Shaders
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/clean-shaders.sh
 SHADERS_SRV
-
 cat << 'SHADERS_TMR' > /etc/systemd/system/clean-shaders.timer
 [Unit]
-Description=Timer Semanal para Shaders
+Description=Timer Shaders
 [Timer]
 OnCalendar=weekly
 Persistent=true
@@ -254,19 +282,18 @@ Persistent=true
 WantedBy=timers.target
 SHADERS_TMR
 
-# F.3 Health Check System (Notificador de Errores en Boot)
+# F.3 Health Check System
 cat << 'HEALTH_SH' > /usr/local/bin/iceman-health.sh
 #!/bin/bash
 FAILED=\$(systemctl --failed --no-legend | wc -l)
 if [ "\$FAILED" -gt 0 ]; then
-    logger -p user.err "ICEMAN HEALTH: \$FAILED servicios fallaron en el arranque. Se sugiere verificar Snapper."
+    logger -p user.err "ICEMAN HEALTH: \$FAILED servicios fallaron. Verifica Snapper."
 fi
 HEALTH_SH
 chmod +x /usr/local/bin/iceman-health.sh
-
 cat << 'HEALTH_SRV' > /etc/systemd/system/iceman-health.service
 [Unit]
-Description=Iceman OS Health Check
+Description=Iceman Health Check
 After=multi-user.target
 [Service]
 Type=oneshot
@@ -275,8 +302,7 @@ ExecStart=/usr/local/bin/iceman-health.sh
 WantedBy=multi-user.target
 HEALTH_SRV
 
-# G. INYECCIÓN VISUAL Y FLATPAK OVERRIDES
-# Global Flatpak Overrides para integrar Temas en Apps
+# G. INYECCIÓN VISUAL
 flatpak override --system --filesystem=~/.themes
 flatpak override --system --filesystem=~/.icons
 flatpak override --system --env=XCURSOR_PATH=/usr/share/icons:~/.local/share/icons
@@ -311,7 +337,7 @@ enabled-extensions=['dash-to-dock@micxgx.gmail.com', 'blur-my-shell@aunetx', 'Vi
 DCONF_EOF
 dconf update
 
-# H. MOTOR DE ARRANQUE (Mkinitcpio, AMD P-State, GRUB, Plymouth)
+# H. MOTOR DE ARRANQUE (Mkinitcpio, GRUB, Plymouth)
 if [ "$USE_LUKS" == "YES" ]; then
     sed -i '/^HOOKS=/c\HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)' /etc/mkinitcpio.conf
 else
@@ -322,27 +348,25 @@ mkinitcpio -P
 
 plymouth-set-default-theme -R bgrt || true
 
-# Extracción de Tema Particle
 wget -qO /tmp/grubtheme.tar.gz "$GRUB_THEME_URL" || true
 mkdir -p /usr/share/grub/themes/Particle-circle
 tar -xf /tmp/grubtheme.tar.gz --strip-components=1 -C /usr/share/grub/themes/Particle-circle/ || true
 
 sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
-# AMD P-State EPP Active inyectado para latencia ultra-baja
-CMD="quiet splash loglevel=3 amdgpu.ppfeaturemask=0xffffffff amd_pstate=active apparmor=1 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
-sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$CMD\"|" /etc/default/grub
+sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$OPT_KERNEL\"|" /etc/default/grub
 echo "GRUB_GFXMODE=$GRUB_GFXMODE" >> /etc/default/grub
 echo 'GRUB_THEME="/usr/share/grub/themes/Particle-circle/theme.txt"' >> /etc/default/grub
 
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ICEMAN_OS
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# I. SECURE BOOT AUTO-ENROLL
-sbctl create-keys
-sbctl sign -s /boot/vmlinuz-linux-cachyos || true
-sbctl sign -s /boot/efi/EFI/ICEMAN_OS/grubx64.efi || true
+# I. SECURE BOOT (Solo si el perfil lo habilita)
+if [ "$OPT_SECUREBOOT" == "YES" ]; then
+    sbctl create-keys
+    sbctl sign -s /boot/vmlinuz-linux-cachyos || true
+    sbctl sign -s /boot/efi/EFI/ICEMAN_OS/grubx64.efi || true
 
-cat << 'SBAUTO_SH' > /usr/local/bin/sb-auto-enroll.sh
+    cat << 'SBAUTO_SH' > /usr/local/bin/sb-auto-enroll.sh
 #!/bin/bash
 if sbctl status | grep -q "Setup Mode:.*Enabled"; then
     sbctl enroll-keys -m
@@ -350,9 +374,9 @@ if sbctl status | grep -q "Setup Mode:.*Enabled"; then
     rm /etc/systemd/system/sb-auto-enroll.service /usr/local/bin/sb-auto-enroll.sh
 fi
 SBAUTO_SH
-chmod +x /usr/local/bin/sb-auto-enroll.sh
+    chmod +x /usr/local/bin/sb-auto-enroll.sh
 
-cat << 'SBAUTO_SRV' > /etc/systemd/system/sb-auto-enroll.service
+    cat << 'SBAUTO_SRV' > /etc/systemd/system/sb-auto-enroll.service
 [Unit]
 Description=Iceman Secure Boot Auto-Enroll
 After=network.target
@@ -363,6 +387,8 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 SBAUTO_SRV
+    systemctl enable sb-auto-enroll.service
+fi
 
 # J. MANTENIMIENTO ACTIVO (Snapper y ZSH)
 snapper --no-dbus -c root create-config /
@@ -377,7 +403,7 @@ chsh -s /usr/bin/zsh "$USERNAME"
 # K. ACTIVACIÓN DE SERVICIOS
 systemctl enable gdm NetworkManager bluetooth ufw apparmor ananicy-cpp reflector.timer
 systemctl enable grub-btrfsd systemd-zram-setup@zram0.service btrfs-scrub@-.timer snapper-timeline.timer
-systemctl enable input-remapper clean-shaders.timer iceman-health.service sb-auto-enroll.service
+systemctl enable input-remapper clean-shaders.timer iceman-health.service
 
 # Limpieza Profunda
 rm -rf /tmp/yay-bin /tmp/iceman_assets /tmp/grubtheme.tar.gz
@@ -400,8 +426,13 @@ run "Sellando entorno y limpiando logs" "
 echo -e "\n\033[1;32m==============================================================\033[0m"
 echo -e "\033[1;32m   ICE-GNOME-ULTRA DESPLEGADO CON ÉXITO ABSOLUTO              \033[0m"
 echo -e "\033[1;32m==============================================================\033[0m"
-echo -e "\033[1;33m[i] AUTO-ENROLL PREPARADO:\033[0m"
-echo -e "Las llaves están creadas y el servicio 'oneshot' está armado."
-echo -e "Si reinicias y tu BIOS está en Setup Mode, el sistema registrará las llaves"
-echo -e "automáticamente y destruirá el script de registro para no dejar rastro."
+if [[ "$IS_VM" == "none" ]]; then
+    echo -e "\033[1;33m[i] AUTO-ENROLL DE SECURE BOOT PREPARADO:\033[0m"
+    echo -e "Las llaves están creadas. Si tu BIOS está en Setup Mode, el sistema"
+    echo -e "las registrará automáticamente en el próximo arranque."
+else
+    echo -e "\033[1;34m[i] INSTALACIÓN EN MÁQUINA VIRTUAL COMPLETADA:\033[0m"
+    echo -e "Sistema configurado en Modo Seguro. (Secure Boot e inyecciones"
+    echo -e "agresivas de Kernel P-State fueron omitidas para garantizar estabilidad)."
+fi
 echo -e "¡Tu estación de combate te espera! Escribe 'reboot'."
