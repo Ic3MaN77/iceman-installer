@@ -1,606 +1,407 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS ARCHITECT - TITANIUM ULTRA (v3.0 BAZZITE-LIKE)
-# Hardware: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT
-# Enfoque: Arquitectura Original (Task Loop) + DCONF Nativo + Auto-SecureBoot
+# ICEMAN OS - ICE-GNOME-ULTRA (v5.0 - THE DEFINITIVE MASTERPIECE)
+# Arquitectura: Clean Room (Host -> Chroot Inyectado)
+# Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | CachyOS Kernel
+# Contenido: 100% Core + 100% User-Space Apps + Bazzite-like Gaming
 # ==============================================================================
-set +e
 
-# ── Colores ────────────────────────────────────────────────────────────────────
-C_CYAN='\033[1;36m'
-C_GREEN='\033[1;32m'
-C_RED='\033[1;31m'
-C_YELLOW='\033[1;33m'
-C_DEF='\033[0m'
+set -Eeuo pipefail
 
-# ── Logs (Memoria RAM Segura) ──────────────────────────────────────────────────
-LOG_FILE="/tmp/iceman-install.log"
-ERR_LOG="/tmp/iceman-errors.log"
-INSTALL_START=$SECONDS
-VERBOSE=false
-[[ "${1:-}" == "--verbose" ]] && VERBOSE=true
-
-clear
-echo -e "${C_CYAN}======================================================${C_DEF}"
-echo -e "${C_GREEN}   ICEMAN OS ARCHITECT - TITANIUM ULTRA (v3.0)        ${C_DEF}"
-echo -e "${C_CYAN}======================================================${C_DEF}\n"
-
-echo -e "${C_YELLOW}[!] Inicializando matriz GNOME nativa, por favor espere...${C_DEF}\n"
-
+LOG_FILE="/tmp/iceman_ultra_install.log"
 > "$LOG_FILE"
-> "$ERR_LOG"
-echo "--- INICIO DE INSTALACIÓN TITANIUM ULTRA ---" > "$LOG_FILE"
 
-# ── Trap de Seguridad ──────────────────────────────────────────────────────────
-cleanup_on_fail() {
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        echo -e "\n${C_RED}[!] ERROR CRÍTICO DETECTADO. Iniciando protocolo de emergencia...${C_DEF}"
-        rm -f /mnt/iceman_chroot.sh /mnt/iceman.conf 2>/dev/null || true
-        umount -R /mnt 2>/dev/null || true
-        cryptsetup close cryptroot 2>/dev/null || true
-        echo -e "${C_YELLOW}[!] Volúmenes desmontados y cifrado sellado por seguridad.${C_DEF}"
-        echo -e "${C_CYAN}[i] Puedes revisar el log escribiendo: less $LOG_FILE${C_DEF}"
-    fi
-    exit $exit_code
+# --- Funciones de Interfaz ---
+print_info() { echo -e "\033[1;36m[i] $1\033[0m"; }
+print_success() { echo -e "\033[1;32m[✓] $1\033[0m"; }
+print_error() { 
+    echo -e "\n\033[1;31m[!] FATAL ERROR: $1\033[0m"
+    tail -n 20 "$LOG_FILE"
+    exit 1
 }
-trap cleanup_on_fail EXIT
 
-# ── Motor de Tareas ────────────────────────────────────────────────────────────
-run_task() {
-    local msg="$1"
-    local cmd="$2"
-    local ret=0
-
-    if $VERBOSE; then
-        echo -e "${C_YELLOW}[→]${C_DEF} ${C_CYAN}${msg}${C_DEF}"
-        bash -c "$cmd" 2>&1 | tee -a "$LOG_FILE"
-        ret=${PIPESTATUS[0]}
+run() {
+    echo -n -e "\033[1;33m[...] $1...\033[0m"
+    if eval "$2" >> "$LOG_FILE" 2>&1; then
+        echo -e "\r\033[1;32m[✓] $1... OK!\033[0m\033[K"
     else
-        bash -c "$cmd" >> "$LOG_FILE" 2>&1 &
-        local pid=$!
-        local spinstr='|/-\'
-        while kill -0 $pid 2>/dev/null; do
-            local temp=${spinstr#?}
-            printf "\r${C_YELLOW}[%c]${C_DEF} ${C_CYAN}%s...${C_DEF}" "$spinstr" "$msg"
-            spinstr=$temp${spinstr%"$temp"}
-            sleep 0.1
-        done
-        wait $pid
-        ret=$?
-    fi
-
-    if [ $ret -eq 0 ]; then
-        printf "\r${C_GREEN}[✓] %s... Completado!${C_DEF}\033[K\n" "$msg"
-    else
-        printf "\r${C_RED}[✗] %s... FALLÓ (revisa %s)${C_DEF}\033[K\n" "$msg" "$LOG_FILE"
-        exit 1
+        echo -e "\r\033[1;31m[✗] $1... FALLÓ!\033[0m\033[K"
+        print_error "Error en la fase: $1"
     fi
 }
 
 # ==============================================================================
-# 1. SEGURIDAD Y VALIDACIÓN DE ENTORNO
+# FASE 1: RECOPILACIÓN DE DATOS E INFRAESTRUCTURA (HOST)
 # ==============================================================================
-if [[ ! -d /sys/firmware/efi/efivars ]]; then
-    echo -e "${C_RED}[✗] Sistema no arrancado en UEFI. Abortando.${C_DEF}"; exit 1
-fi
-if ! ping -c 1 archlinux.org &>/dev/null; then
-    echo -e "${C_RED}[✗] Sin conexión a Internet. Abortando.${C_DEF}"; exit 1
-fi
+clear
+echo -e "\033[1;36m==============================================================\033[0m"
+echo -e "\033[1;36m          ICEMAN OS - ICE GNOME ULTRA DEPLOYMENT              \033[0m"
+echo -e "\033[1;36m==============================================================\033[0m\n"
 
 timedatectl set-ntp true
-mount -o remount,size=4G /run/archiso/cowspace 2>/dev/null || true
 
-run_task "Actualizando Infraestructura de Espejos" \
-    "pacman -Sy --noconfirm archlinux-keyring reflector && \
-     reflector --country Spain,France,Germany --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist"
+# Selección de Hardware
+mapfile -t DISKS < <(lsblk -d -n -p -o NAME,SIZE,MODEL | grep -v "loop")
+for i in "${!DISKS[@]}"; do echo "  $((i+1))) ${DISKS[$i]}"; done
+read -p "➤ Selecciona disco de instalación [1]: " D_SEL; D_SEL=${D_SEL:-1}
+TARGET_DISK=$(echo "${DISKS[$((D_SEL-1))]}" | awk '{print $1}')
 
-run_task "Inyectando Llaves CachyOS" \
-    "pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keyserver.ubuntu.com && \
-     pacman-key --lsign-key F3B607488DB35A47"
-
-run_task "Montando Repositorio Maestro CachyOS" \
-    "sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf || true && \
-     printf '\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n' >> /etc/pacman.conf && \
-     pacman -Sy"
-
-# ==============================================================================
-# 2. CONFIGURACIÓN INTERACTIVA
-# ==============================================================================
-echo -e "\n${C_YELLOW}--- PERFIL Y TOPOLOGÍA DE ALMACENAMIENTO ---${C_DEF}"
-
-echo -e "\n  1) Full Gaming  (Steam, Wine, Mandos, OBS, Shaders...)"
-echo -e "  2) Desktop Limpio  (Solo GNOME y herramientas de productividad)"
-read -p "➤ Perfil de instalación [1-2] (Por defecto: 1): " PROFILE_SEL
-INSTALL_PROFILE=${PROFILE_SEL:-1}
-
-mapfile -t DISKS_PATH < <(lsblk -d -n -p -o NAME,TYPE | awk '$2=="disk" {print $1}')
-mapfile -t DISKS_INFO < <(lsblk -d -n -p -o NAME,SIZE,TYPE | awk '$3=="disk" {print $1 " (" $2 ")"}')
-
-echo -e "\nDiscos disponibles:"
-for i in "${!DISKS_INFO[@]}"; do echo "  $((i+1))) ${DISKS_INFO[$i]}"; done
-while true; do
-    read -p "➤ Selecciona disco de destino [1-${#DISKS_INFO[@]}]: " DISK_SEL
-    if [[ "$DISK_SEL" =~ ^[0-9]+$ ]] && [ "$DISK_SEL" -ge 1 ] && [ "$DISK_SEL" -le "${#DISKS_INFO[@]}" ]; then
-        TARGET_DISK="${DISKS_PATH[$((DISK_SEL-1))]}"
-        break
-    else echo -e "${C_RED}[!] Selección inválida.${C_DEF}"; fi
-done
-
-read -p "➤ ¿Cifrar disco completo con LUKS2? [s/N] (Por defecto: N): " LUKS_ANS
-if [[ ${LUKS_ANS,,} =~ ^(s|y)$ ]]; then
+# Credenciales y Seguridad
+read -p "➤ ¿Cifrar disco con LUKS2 (Argon2id)? (s/N): " ANS_LUKS
+if [[ "${ANS_LUKS,,}" == "s" ]]; then
     USE_LUKS="YES"
     while true; do
-        read -s -p "  Contraseña LUKS: " LUKS_PASS1; echo ""
-        read -s -p "  Confirma LUKS:   " LUKS_PASS2; echo ""
-        [[ "$LUKS_PASS1" == "$LUKS_PASS2" && -n "$LUKS_PASS1" ]] && break || echo -e "${C_RED}[!] Las contraseñas no coinciden. Repite.${C_DEF}"
+        read -s -p "  ➤ Contraseña Maestra (LUKS/Root/User): " MASTER_PASS; echo ""
+        read -s -p "  ➤ Confirma Contraseña Maestra:         " CONFIRM_PASS; echo ""
+        [[ "$MASTER_PASS" == "$CONFIRM_PASS" && -n "$MASTER_PASS" ]] && break || echo -e "\033[1;31m[!] Las contraseñas no coinciden.\033[0m"
     done
-else
+else 
     USE_LUKS="NO"
-    LUKS_PASS1=""
+    while true; do
+        read -s -p "  ➤ Contraseña (Root/User): " MASTER_PASS; echo ""
+        read -s -p "  ➤ Confirma Contraseña:    " CONFIRM_PASS; echo ""
+        [[ "$MASTER_PASS" == "$CONFIRM_PASS" && -n "$MASTER_PASS" ]] && break || echo -e "\033[1;31m[!] Las contraseñas no coinciden.\033[0m"
+    done
 fi
 
-read -p "➤ Nombre de usuario administrador [Por defecto: iceman]: " USERNAME
-USERNAME=${USERNAME:-iceman}
-while true; do
-    read -s -p "➤ Contraseña para $USERNAME (y root): " USER_PASS1; echo ""
-    read -s -p "➤ Confirma la contraseña:              " USER_PASS2; echo ""
-    [[ "$USER_PASS1" == "$USER_PASS2" && -n "$USER_PASS1" ]] && break || echo -e "${C_RED}[!] Las contraseñas no coinciden. Repite.${C_DEF}"
-done
+read -p "➤ Usuario [iceman]: " USERNAME; USERNAME=${USERNAME:-iceman}
+read -p "➤ Hostname [iceman-pc]: " HOSTNAME_PC; HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
 
-read -p "➤ Nombre del equipo [Por defecto: iceman-pc]: " HOSTNAME_PC
-HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
+# Enlaces a los Assets
+CURSOR_URL="https://github.com/vinceliuice/Qogir-icon-theme/archive/refs/tags/2023-06-05.tar.gz"
+GRUB_THEME_URL="https://github.com/yeyushengfan258/Particle-circle-grub-theme/archive/refs/heads/main.tar.gz"
 
-RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | grep -v '^i' | sort -t'x' -k2 -n | tail -1)
-case "$RAW_RES" in
-    3840x2160*) GRUB_SCREEN="4k"; GRUB_GFXMODE="3840x2160x32" ;;
-    2560x1440*) GRUB_SCREEN="2k"; GRUB_GFXMODE="2560x1440x32" ;;
-    *)          GRUB_SCREEN="1080p"; GRUB_GFXMODE="1920x1080x32" ;;
-esac
+RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | head -n 1 || echo "1920x1080")
+GRUB_GFXMODE="${RAW_RES}x32"
 
-echo -e "\n${C_CYAN}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_CYAN}║     RESUMEN DE INSTALACIÓN (ULTRA)       ║${C_DEF}"
-echo -e "${C_CYAN}╠══════════════════════════════════════════╣${C_DEF}"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "Disco"        "$TARGET_DISK"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "LUKS2"        "$USE_LUKS"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "Usuario"      "$USERNAME"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "Perfil"       "$([ "$INSTALL_PROFILE" == "1" ] && echo 'Full Gaming Bazzite-like' || echo 'Desktop Limpio')"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "GRUB Theme"   "Particle Circle @ ${GRUB_SCREEN}"
-printf "${C_CYAN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n"  "Seguridad"    "Secure Boot Automático"
-echo -e "${C_CYAN}╚══════════════════════════════════════════╝${C_DEF}"
-echo -e "\n${C_RED}[!] ADVERTENCIA: Se destruirán TODOS los datos en ${TARGET_DISK}${C_DEF}"
-read -p "➤ Escribe 'CONFIRMAR' para continuar (o aborta): " CONFIRM_INPUT
-[[ "$CONFIRM_INPUT" != "CONFIRMAR" ]] && { echo -e "${C_YELLOW}Instalación abortada por el usuario.${C_DEF}"; exit 0; }
-
-# ==============================================================================
-# 3. CIRUGÍA DE DISCO Y BTRFS
-# ==============================================================================
-run_task "Purgando Sectores y Particionando GPT" "
-    umount -A -R /mnt 2>/dev/null || true
-    cryptsetup close cryptroot 2>/dev/null || true
-    wipefs -a ${TARGET_DISK}
-    sgdisk -Z ${TARGET_DISK}
-    sgdisk -n 1:0:+1G -t 1:ef00 -c 1:EFI  ${TARGET_DISK}
-    sgdisk -n 2:0:0   -t 2:8300 -c 2:ROOT ${TARGET_DISK}
-    partprobe ${TARGET_DISK}
-    sleep 2
+# 1.1 Limpieza y Particionado
+run "Desmontando sistemas previos" "umount -A -R /mnt 2>/dev/null || true; cryptsetup close cryptroot 2>/dev/null || true"
+run "Limpieza de tabla de particiones en $TARGET_DISK" "wipefs -a $TARGET_DISK; sgdisk -Z $TARGET_DISK"
+run "Creando particiones GPT (EFI + ROOT)" "
+    sgdisk -n 1:0:+1024M -t 1:ef00 -c 1:EFI $TARGET_DISK
+    sgdisk -n 2:0:0      -t 2:8300 -c 2:ROOT $TARGET_DISK
+    partprobe $TARGET_DISK; sleep 2
 "
 
-if [[ "$TARGET_DISK" == *"nvme"* ]] || [[ "$TARGET_DISK" == *"mmcblk"* ]]; then
-    P1="${TARGET_DISK}p1"; P2="${TARGET_DISK}p2"
-else
-    P1="${TARGET_DISK}1"; P2="${TARGET_DISK}2"
-fi
+[[ "$TARGET_DISK" == *"nvme"* || "$TARGET_DISK" == *"mmcblk"* ]] && { P_EFI="${TARGET_DISK}p1"; P_ROOT="${TARGET_DISK}p2"; } || { P_EFI="${TARGET_DISK}1"; P_ROOT="${TARGET_DISK}2"; }
 
-mkfs.fat -F32 -n EFI "$P1" >/dev/null
-
+# 1.2 Formateo y LUKS
+run "Formateando partición EFI" "mkfs.fat -F32 -n EFI $P_EFI"
 if [[ "$USE_LUKS" == "YES" ]]; then
-    echo -n "$LUKS_PASS1" | cryptsetup luksFormat --type luks2 --pbkdf argon2id "$P2" -
-    echo -n "$LUKS_PASS1" | cryptsetup open "$P2" cryptroot -
-    T_ROOT="/dev/mapper/cryptroot"
-else
-    T_ROOT="$P2"
-fi
+    run "Cifrando partición ROOT (LUKS2 + Argon2id)" "
+        echo -n '$MASTER_PASS' | cryptsetup luksFormat --type luks2 --pbkdf argon2id $P_ROOT -
+        echo -n '$MASTER_PASS' | cryptsetup open $P_ROOT cryptroot -
+    "
+    M_ROOT="/dev/mapper/cryptroot"
+else M_ROOT="$P_ROOT"; fi
 
-mkfs.btrfs -f -L ICEMAN_OS "$T_ROOT" >/dev/null
-mount "$T_ROOT" /mnt
-for sv in @ @home @var_log @pkg @cache @snapshots; do btrfs subvolume create /mnt/$sv >/dev/null; done
-umount /mnt
-
-B_OPTS="rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2"
-mount -o "${B_OPTS},subvol=@"          "$T_ROOT" /mnt
-mkdir -p /mnt/{boot/efi,home,var/log,var/cache/pacman/pkg,var/cache,.snapshots}
-mount -o "${B_OPTS},subvol=@home"      "$T_ROOT" /mnt/home
-mount -o "${B_OPTS},subvol=@var_log"   "$T_ROOT" /mnt/var/log
-mount -o "${B_OPTS},subvol=@pkg"       "$T_ROOT" /mnt/var/cache/pacman/pkg
-mount -o "${B_OPTS},subvol=@cache"     "$T_ROOT" /mnt/var/cache
-mount -o "${B_OPTS},subvol=@snapshots" "$T_ROOT" /mnt/.snapshots
-mount "$P1" /mnt/boot/efi
-
-# ==============================================================================
-# 4. PACSTRAP (SISTEMA BASE BLINDADO + SBCTL)
-# ==============================================================================
-run_task "Configurando Esqueleto de Locales" "
-    mkdir -p /mnt/etc
-    echo 'KEYMAP=es' > /mnt/etc/vconsole.conf
-    echo 'LANG=es_ES.UTF-8' > /mnt/etc/locale.conf
+# 1.3 Infraestructura BTRFS
+run "Estructurando subvolúmenes BTRFS" "
+    mkfs.btrfs -f -L ICEMAN_OS $M_ROOT
+    mount $M_ROOT /mnt
+    for sv in @ @home @var_log @pkg @cache @snapshots; do btrfs subvolume create /mnt/\$sv; done
+    umount /mnt
 "
 
-BASE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware \
-sof-firmware amd-ucode cachyos-keyring cachyos-mirrorlist btrfs-progs \
-btrfsmaintenance nano vim git networkmanager grub efibootmgr os-prober plymouth \
-ufw apparmor pacman-contrib sudo zram-generator cups avahi nss-mdns sane \
-wget curl p7zip unzip ntfs-3g exfatprogs dosfstools mtools fuse3 sbctl"
-[[ "$USE_LUKS" == "YES" ]] && BASE_PKGS+=" cryptsetup"
+run "Montando árbol final BTRFS" "
+    B_OPTS='rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2'
+    mount -o \$B_OPTS,subvol=@ $M_ROOT /mnt
+    mkdir -p /mnt/{boot/efi,home,var/log,var/cache/pacman/pkg,var/cache,.snapshots}
+    mount -o \$B_OPTS,subvol=@home $M_ROOT /mnt/home
+    mount -o \$B_OPTS,subvol=@var_log $M_ROOT /mnt/var/log
+    mount -o \$B_OPTS,subvol=@pkg $M_ROOT /mnt/var/cache/pacman/pkg
+    mount -o \$B_OPTS,subvol=@cache $M_ROOT /mnt/var/cache
+    mount -o \$B_OPTS,subvol=@snapshots $M_ROOT /mnt/.snapshots
+    mount $P_EFI /mnt/boot/efi
+"
 
-run_task "Inyectando Sistema Base y Kernel CachyOS" "pacstrap -K /mnt ${BASE_PKGS}"
+# 1.4 Repositorios y Sistema Base (Pacstrap)
+run "Configurando repositorios CachyOS en Host" "
+    pacman -Sy --noconfirm archlinux-keyring cachyos-keyring
+    sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf || true
+    printf '\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n' >> /etc/pacman.conf
+    pacman -Sy
+"
 
-run_task "Generando Tablas Fstab y Crypttab" "
+CORE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode cachyos-keyring cachyos-mirrorlist cachyos-settings cachyos-hooks btrfs-progs btrfsmaintenance networkmanager git nano vim wget curl sudo zram-generator ufw apparmor grub efibootmgr os-prober plymouth plymouth-theme-spinner snapper snap-pac grub-btrfs inotify-tools sbctl"
+FS_PKGS="ntfs-3g exfatprogs dosfstools mtools fuse3 unzip p7zip rsync"
+[[ "$USE_LUKS" == "YES" ]] && CORE_PKGS="$CORE_PKGS cryptsetup"
+
+run "Inyectando Sistema Base (Pacstrap)" "pacstrap -K /mnt $CORE_PKGS $FS_PKGS"
+
+run "Generando fstab y crypttab" "
     genfstab -U /mnt >> /mnt/etc/fstab
-    sed -i 's/subvolid=[0-9]*,//g' /mnt/etc/fstab
+    [[ '$USE_LUKS' == 'YES' ]] && echo \"cryptroot UUID=\$(blkid -s UUID -o value $P_ROOT) none luks,discard\" > /mnt/etc/crypttab || true
 "
-[[ "$USE_LUKS" == "YES" ]] && echo "cryptroot UUID=$(blkid -s UUID -o value "$P2") none luks,discard" > /mnt/etc/crypttab
 
 # ==============================================================================
-# 5. INYECCIÓN DEL SCRIPT CHROOT (THE MATRIX)
+# FASE 2: CONSTRUCCIÓN DEL ENTORNO 'CLEAN ROOM' (EL MOTOR CHROOT)
 # ==============================================================================
-cat > /mnt/iceman.conf << CONFIG
-USERNAME="${USERNAME}"
-USER_PASS1="${USER_PASS1}"
-USE_LUKS="${USE_LUKS}"
-HOSTNAME_PC="${HOSTNAME_PC}"
-INSTALL_PROFILE="${INSTALL_PROFILE}"
-GRUB_GFXMODE="${GRUB_GFXMODE}"
-GRUB_SCREEN="${GRUB_SCREEN}"
-CONFIG
-chmod 600 /mnt/iceman.conf
+print_info "Ensamblando motor de configuración interna (Arquitectura Aislada)..."
 
-cat << 'EOF' > /mnt/iceman_chroot.sh
+cat << EOF > /mnt/root/install_vars.sh
+USERNAME="$USERNAME"
+MASTER_PASS="$MASTER_PASS"
+HOSTNAME_PC="$HOSTNAME_PC"
+USE_LUKS="$USE_LUKS"
+GRUB_GFXMODE="$GRUB_GFXMODE"
+CURSOR_URL="$CURSOR_URL"
+GRUB_THEME_URL="$GRUB_THEME_URL"
+EOF
+
+cat << 'CHROOT_EOF' > /mnt/root/install_internal.sh
 #!/bin/bash
-source /iceman.conf
-E_LOG="/var/log/iceman-errors.log"
+set -Eeuo pipefail
+source /root/install_vars.sh
+export MAKEFLAGS="-j$(nproc)"
 
-install_pacman() { for pkg in "$@"; do pacman -S --needed --noconfirm "$pkg" || echo "[$(date +%T)] [PACMAN] Falló: $pkg" >> "$E_LOG"; done; }
-install_aur() { for pkg in "$@"; do sudo -u "$USERNAME" yay -S --needed --noconfirm "$pkg" || echo "[$(date +%T)] [AUR] Falló: $pkg" >> "$E_LOG"; done; }
+# A. OPTIMIZACIÓN DE PACMAN Y REPOS
+sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf
+echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+sed -i 's/^#Color/Color\nILoveCandy/' /etc/pacman.conf
+sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
+pacman -Sy --noconfirm
 
-task_1() {
-    ln -sf /usr/share/zoneinfo/Europe/Madrid /etc/localtime && hwclock --systohc
-    sed -i 's/^#es_ES.UTF-8 UTF-8/es_ES.UTF-8 UTF-8/' /etc/locale.gen && locale-gen
-    echo 'LANG=es_ES.UTF-8' > /etc/locale.conf
-    echo 'KEYMAP=es' > /etc/vconsole.conf
-    echo "$HOSTNAME_PC" > /etc/hostname
-    printf "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.1.1\t%s.localdomain %s\n" "$HOSTNAME_PC" "$HOSTNAME_PC" > /etc/hosts
+# B. LOCALIZACIÓN
+ln -sf /usr/share/zoneinfo/Europe/Madrid /etc/localtime
+hwclock --systohc
+echo -e "es_ES.UTF-8 UTF-8\nen_US.UTF-8 UTF-8" > /etc/locale.gen
+locale-gen
+echo "LANG=es_ES.UTF-8" > /etc/locale.conf
+echo "KEYMAP=es" > /etc/vconsole.conf
+echo "$HOSTNAME_PC" > /etc/hostname
+printf "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.1.1\t%s.localdomain %s\n" "$HOSTNAME_PC" "$HOSTNAME_PC" > /etc/hosts
 
-    echo "root:$USER_PASS1" | chpasswd
-    useradd -m -G wheel,video,audio,storage,optical,network,lp,scanner -s /bin/bash "$USERNAME"
-    echo "$USERNAME:$USER_PASS1" | chpasswd
+# C. USUARIO Y VARIABLES GLOBALES (Wayland Nativo)
+echo "root:$MASTER_PASS" | chpasswd
+useradd -m -G wheel,video,audio,storage,network,input,gamemode -s /bin/bash "$USERNAME"
+echo "$USERNAME:$MASTER_PASS" | chpasswd
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-wheel
 
-    echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-iceman-install
-    chmod 440 /etc/sudoers.d/99-iceman-install
-    
-    mkdir -p /etc/polkit-1/rules.d/
-    cat << 'POLKIT1' > /etc/polkit-1/rules.d/49-nopasswd-wheel.rules
-polkit.addAdminRule(function(action, subject) { return ["unix-group:wheel"]; });
-polkit.addRule(function(action, subject) {
-    if (subject.isInGroup("wheel")) {
-        if (action.id.indexOf("org.freedesktop.color-manager.") == 0 ||
-            action.id.indexOf("org.freedesktop.packagekit.") == 0 ||
-            action.id.indexOf("org.freedesktop.NetworkManager.") == 0 ||
-            action.id.indexOf("org.freedesktop.login1.") == 0 ||
-            action.id.indexOf("org.gnome.settings-daemon.plugins.power.") == 0) {
-            return polkit.Result.YES;
-        }
-    }
-});
-POLKIT1
+cat << 'ENV_VARS' >> /etc/environment
+# Forzar Electron/Chromium en Wayland Nativo
+ELECTRON_OZONE_PLATFORM_HINT=auto
+MOZ_ENABLE_WAYLAND=1
+ENV_VARS
 
-    cat << 'POLKIT2' > /etc/polkit-1/rules.d/90-corectrl.rules
-polkit.addRule(function(action, subject) {
-    if ((action.id == "org.corectrl.helper.init" ||
-         action.id == "org.corectrl.helperkiller.init") &&
-        subject.local == true &&
-        subject.active == true &&
-        subject.isInGroup("corectrl")) {
-            return polkit.Result.YES;
-    }
-});
-POLKIT2
+# D. INSTALACIÓN DE MÓDULOS (AMD, UI, Multimedia Pro)
+PACMAN_CMD="pacman -S --needed --noconfirm"
+
+# D.1 Drivers AMD y Multimedia (GStreamer Full)
+$PACMAN_CMD xf86-video-amdgpu mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver
+$PACMAN_CMD pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav bluez bluez-utils
+
+# D.2 Audio Low-Latency (Pro Audio Bazzite-like)
+mkdir -p /etc/pipewire/pipewire.conf.d
+cat << 'PIPEWIRE' > /etc/pipewire/pipewire.conf.d/92-low-latency.conf
+context.properties = {
+    default.clock.rate = 48000
+    default.clock.allowed-rates = [ 44100 48000 88200 96000 ]
+    default.clock.min-quantum = 32
+    default.clock.max-quantum = 1024
 }
+PIPEWIRE
 
-task_2() {
-    pacman-key --init && pacman-key --populate archlinux cachyos
-    sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
-    sed -i '/^\[cachyos\]/{N;d}' /etc/pacman.conf
-    sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf
-    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
-    sed -i 's/^#Color/Color/' /etc/pacman.conf
-    grep -qx 'ILoveCandy' /etc/pacman.conf || sed -i '/^Color/a ILoveCandy' /etc/pacman.conf
-    pacman -Syyu --noconfirm
-}
+# D.3 Entorno GNOME y Flatpak
+$PACMAN_CMD gnome gnome-tweaks gdm xdg-desktop-portal-gnome firefox gnome-shell-extension-dash-to-dock gnome-shell-extension-appindicator flatpak
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
 
-task_3() {
-    sed -i "s/^#MAKEFLAGS=\"-j2\"/MAKEFLAGS=\"-j$(nproc)\"/" /etc/makepkg.conf
-    sudo -u "$USERNAME" bash -c 'cd /tmp && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm'
-}
+# D.4 Gaming Bazzite-Like
+$PACMAN_CMD steam steam-native-runtime lutris wine-staging winetricks gamemode lib32-gamemode corectrl mangohud vkbasalt ananicy-cpp
 
-task_4() {
-    PKGS_HW=(
-        mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-mesa-layers lib32-vulkan-mesa-layers
-        libva-mesa-driver lib32-libva-mesa-driver xf86-video-amdgpu bluez bluez-utils pipewire 
-        pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber realtime-privileges 
-        corectrl mangohud lib32-mangohud ananicy-cpp file-roller gst-plugins-good gst-plugins-bad 
-        gst-plugins-ugly gst-libav libavcodec tumbler ffmpegthumbnailer webp-pixbuf-loader poppler-glib freerdp
-    )
-    install_pacman "${PKGS_HW[@]}"
+# E. COMPILACIÓN AUR Y GESTIÓN (THE MISSING PIECES RESTORED)
+sudo -u "$USERNAME" bash -c "cd /tmp && git clone --depth=1 https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm"
 
-    cat > /etc/sysctl.d/99-gaming.conf << 'SYSCTL'
-vm.max_map_count=2147483642
-vm.swappiness=10
-net.core.default_qdisc=fq_pie
-net.ipv4.tcp_congestion_control=bbr
-SYSCTL
+# E.1 Herramientas de Gestión Gráfica y Productividad
+sudo -u "$USERNAME" yay -S --noconfirm pamac-aur libpamac-flatpak-plugin btrfs-assistant mission-center stacer-bin onlyoffice-bin extension-manager ttf-ms-fonts
 
-    usermod -aG realtime,corectrl "$USERNAME"
+# E.2 Drivers de Mandos Xbox/PS, Extensiones y Temas Visuales
+sudo -u "$USERNAME" yay -S --noconfirm xone-dkms xpadneo-dkms input-remapper-git \
+    adw-gtk3-git papirus-icon-theme qogir-cursor-theme \
+    gnome-shell-extension-blur-my-shell gnome-shell-extension-vitals
 
-    mkdir -p /home/$USERNAME/.config/autostart
-    cat > /home/$USERNAME/.config/autostart/corectrl.desktop << 'CORECTRL'
-[Desktop Entry]
-Type=Application
-Exec=corectrl --minimize-systray
-Hidden=false
-X-GNOME-Autostart-enabled=true
-Name=CoreCtrl
-CORECTRL
-    systemctl enable bluetooth ananicy-cpp avahi-daemon cups btrfsmaintenance-refresh.service
-}
+# F. BLINDAJE Y RENDIMIENTO (UFW, AppArmor, ZRAM)
+ufw default deny incoming
+ufw default allow outgoing
+cat << 'ZRAM' > /etc/systemd/zram-generator.conf
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+ZRAM
 
-task_5() {
-    PKGS_GNOME=(
-        gnome gnome-tweaks gdm xdg-desktop-portal-gnome flatpak power-profiles-daemon
-        ttf-ubuntu-font-family ttf-dejavu ttf-liberation ttf-roboto noto-fonts
-        sushi nautilus-image-converter python-nautilus gnome-browser-connector
-        gnome-software gnome-software-packagekit-plugin systemd-oomd
-    )
-    install_pacman "${PKGS_GNOME[@]}"
-    systemctl enable gdm NetworkManager apparmor power-profiles-daemon systemd-oomd
-    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
-}
+# F.2 Auto-Limpieza de Shaders (Mantenimiento Automático)
+cat << 'SHADERS_SH' > /usr/local/bin/clean-shaders.sh
+#!/bin/bash
+find /home/*/.cache/mesa_shader_cache -type f -atime +30 -delete 2>/dev/null || true
+SHADERS_SH
+chmod +x /usr/local/bin/clean-shaders.sh
 
-task_6() {
-    [[ "$INSTALL_PROFILE" != "1" ]] && return 0
+cat << 'SHADERS_SRV' > /etc/systemd/system/clean-shaders.service
+[Unit]
+Description=Limpieza de Cache de Shaders AMD
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/clean-shaders.sh
+SHADERS_SRV
 
-    PKGS_LIBS_32=(
-        giflib lib32-giflib libpng lib32-libpng libldap lib32-libldap gnutls lib32-gnutls
-        mpg123 lib32-mpg123 openal lib32-openal v4l-utils lib32-v4l-utils libpulse lib32-libpulse
-        alsa-plugins lib32-alsa-plugins alsa-lib lib32-alsa-lib sqlite lib32-sqlite libxcomposite
-        lib32-libxcomposite ocl-icd lib32-ocl-icd libva lib32-libva gtk3 lib32-gtk3
-        gst-plugins-base-libs lib32-gst-plugins-base-libs vulkan-icd-loader lib32-vulkan-icd-loader vkd3d
-    )
-    install_pacman "${PKGS_LIBS_32[@]}"
+cat << 'SHADERS_TMR' > /etc/systemd/system/clean-shaders.timer
+[Unit]
+Description=Timer Semanal para Shaders
+[Timer]
+OnCalendar=weekly
+Persistent=true
+[Install]
+WantedBy=timers.target
+SHADERS_TMR
 
-    PKGS_GAMING=(
-        steam steam-native-runtime wine-staging winetricks lutris gamemode lib32-gamemode gamescope
-        game-devices-udev discord obs-studio
-    )
-    install_pacman "${PKGS_GAMING[@]}"
-    
-    install_aur xone-dkms xpadneo-dkms ds4drv protonplus
-    sudo -u "$USERNAME" flatpak install -y flathub com.usebottles.bottles || echo "[FLATPAK] Falló Bottles" >> "$E_LOG"
-}
+# F.3 Health Check System (Notificador de Errores en Boot)
+cat << 'HEALTH_SH' > /usr/local/bin/iceman-health.sh
+#!/bin/bash
+FAILED=\$(systemctl --failed --no-legend | wc -l)
+if [ "\$FAILED" -gt 0 ]; then
+    logger -p user.err "ICEMAN HEALTH: \$FAILED servicios fallaron en el arranque. Se sugiere verificar Snapper."
+fi
+HEALTH_SH
+chmod +x /usr/local/bin/iceman-health.sh
 
-task_7() {
-    AUR_APPS=(
-        pamac-aur libpamac-flatpak-plugin onlyoffice-bin extension-manager
-        btrfs-assistant mission-center stacer-bin ttf-ms-fonts
-    )
-    if [[ "$INSTALL_PROFILE" == "1" ]]; then
-        AUR_APPS+=(goverlay-bin input-remapper-git noisetorch-bin)
-    fi
-    install_aur "${AUR_APPS[@]}"
-    install_pacman firefox thunderbird qbittorrent filezilla
-    [[ "$INSTALL_PROFILE" == "1" ]] && systemctl enable input-remapper || true
-}
+cat << 'HEALTH_SRV' > /etc/systemd/system/iceman-health.service
+[Unit]
+Description=Iceman OS Health Check
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/iceman-health.sh
+[Install]
+WantedBy=multi-user.target
+HEALTH_SRV
 
-task_8() {
-    install_pacman papirus-icon-theme yaru-icon-theme
-    AUR_EST=(
-        adw-gtk3 papirus-folders-git breezex-cursor-theme
-        gnome-shell-extension-dash-to-dock gnome-shell-extension-blur-my-shell
-        gnome-shell-extension-vitals gnome-shell-extension-appindicator
-        gnome-shell-extension-caffeine gnome-shell-extension-clipboard-indicator
-        gnome-shell-extension-gsconnect gnome-shell-extension-just-perfection
-        gnome-shell-extension-gamemode gnome-shell-extension-sound-output-device-chooser
-        gnome-shell-extension-tilingshell gnome-shell-extension-noannoyance
-    )
-    install_aur "${AUR_EST[@]}"
-    papirus-folders -C yaru --theme Papirus-Dark || true
+# G. INYECCIÓN VISUAL Y FLATPAK OVERRIDES
+# Global Flatpak Overrides para integrar Temas en Apps
+flatpak override --system --filesystem=~/.themes
+flatpak override --system --filesystem=~/.icons
+flatpak override --system --env=XCURSOR_PATH=/usr/share/icons:~/.local/share/icons
 
-    # Wallpapers
-    git clone --quiet https://github.com/Ic3MaN77/iceman-installer.git /tmp/iceman-repo
-    mkdir -p /usr/share/backgrounds/iceman /usr/share/gnome-background-properties
-    cp /tmp/iceman-repo/wallpapers/*.webp /usr/share/backgrounds/iceman/ 2>/dev/null || true
-    
-    FIRST_WP=$(ls /usr/share/backgrounds/iceman/*.webp 2>/dev/null | head -n 1 || true)
-    [[ -n "$FIRST_WP" ]] && cp "$FIRST_WP" /usr/share/backgrounds/iceman/default.webp || true
+mkdir -p /usr/share/backgrounds/iceman /usr/share/gnome-background-properties
+git clone --depth=1 https://github.com/Ic3MaN77/iceman-installer.git /tmp/iceman_assets
+cp /tmp/iceman_assets/wallpapers/*.webp /usr/share/backgrounds/iceman/ 2>/dev/null || true
+cp /usr/share/backgrounds/iceman/*.webp /usr/share/backgrounds/iceman/default.webp 2>/dev/null || true
 
-    {
-        echo '<?xml version="1.0" encoding="UTF-8"?><wallpapers>'
-        for wp in /usr/share/backgrounds/iceman/*.webp; do
-            name=$(basename "$wp" .webp)
-            printf '<wallpaper deleted="false"><name>%s</name><filename>%s</filename><options>zoom</options><pcolor>#000</pcolor><scolor>#000</scolor></wallpaper>\n' "$name" "$wp"
-        done
-        echo '</wallpapers>'
-    } > /usr/share/gnome-background-properties/iceman.xml
+echo '<?xml version="1.0" encoding="UTF-8"?><wallpapers>' > /usr/share/gnome-background-properties/iceman.xml
+for wp in /usr/share/backgrounds/iceman/*.webp; do
+    echo "<wallpaper><name>$(basename "$wp" .webp)</name><filename>$wp</filename><options>zoom</options></wallpaper>" >> /usr/share/gnome-background-properties/iceman.xml
+done
+echo '</wallpapers>' >> /usr/share/gnome-background-properties/iceman.xml
 
-    # DCONF NATIVO: Evita el sleep hack y aplica visuales desde GDM/Login
-    mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
-    echo -e "user-db:user\nsystem-db:local" > /etc/dconf/profile/user
-    cat << 'DCONF' > /etc/dconf/db/local.d/01-iceman-theme
+mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
+echo -e "user-db:user\nsystem-db:local" > /etc/dconf/profile/user
+cat << 'DCONF_EOF' > /etc/dconf/db/local.d/01-iceman-core
 [org/gnome/desktop/interface]
 color-scheme='prefer-dark'
 gtk-theme='adw-gtk3-dark'
 icon-theme='Papirus-Dark'
-cursor-theme='BreezeX-Dark'
+cursor-theme='Qogir-dark'
 
 [org/gnome/desktop/background]
 picture-uri='file:///usr/share/backgrounds/iceman/default.webp'
 picture-uri-dark='file:///usr/share/backgrounds/iceman/default.webp'
-DCONF
-    dconf update
-}
 
-task_9() {
-    pacman -S --noconfirm zsh fastfetch zsh-autosuggestions zsh-syntax-highlighting
-    sudo -u "$USERNAME" git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /home/$USERNAME/.oh-my-zsh
-    sudo -u "$USERNAME" git clone --depth=1 https://github.com/romkatv/powerlevel10k.git /home/$USERNAME/.oh-my-zsh/custom/themes/powerlevel10k || true
+[org/gnome/shell]
+disable-user-extensions=false
+enabled-extensions=['dash-to-dock@micxgx.gmail.com', 'blur-my-shell@aunetx', 'Vitals@CoreCoding.com', 'appindicatorsupport@rgcjonas.gmail.com']
+DCONF_EOF
+dconf update
 
-    sudo -u "$USERNAME" bash -c "cat > /home/$USERNAME/.zshrc" << 'ZSHRC'
-export ZSH="$HOME/.oh-my-zsh"
-ZSH_THEME="powerlevel10k/powerlevel10k"
-source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh 2>/dev/null || true
-source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh 2>/dev/null || true
-source "$ZSH/oh-my-zsh.sh" 2>/dev/null || true
-fastfetch -l cachyos
-ZSHRC
-    chsh -s /usr/bin/zsh "$USERNAME"
-}
+# H. MOTOR DE ARRANQUE (Mkinitcpio, AMD P-State, GRUB, Plymouth)
+if [ "$USE_LUKS" == "YES" ]; then
+    sed -i '/^HOOKS=/c\HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)' /etc/mkinitcpio.conf
+else
+    sed -i '/^HOOKS=/c\HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block filesystems fsck btrfs)' /etc/mkinitcpio.conf
+fi
+sed -i '/^MODULES=/c\MODULES=(btrfs amdgpu)' /etc/mkinitcpio.conf
+mkinitcpio -P
 
-task_10() {
-    sed -i 's/^MODULES=()/MODULES=(btrfs amdgpu)/' /etc/mkinitcpio.conf
-    if [[ "$USE_LUKS" == "YES" ]]; then
-        sed -i 's/^HOOKS=(.*/HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)/' /etc/mkinitcpio.conf
-    else
-        sed -i 's/^HOOKS=(.*/HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block filesystems fsck btrfs)/' /etc/mkinitcpio.conf
-    fi
-    plymouth-set-default-theme -R bgrt || true
-    mkinitcpio -P
+plymouth-set-default-theme -R bgrt || true
 
-    pacman -S --noconfirm snapper snap-pac grub-btrfs
-    umount /.snapshots 2>/dev/null || true
-    rm -rf /.snapshots
-    snapper --no-dbus -c root create-config / || true
-    mount -a
-    chmod 750 /.snapshots
-    systemctl enable snapper-timeline.timer snapper-cleanup.timer grub-btrfsd.service || true
+# Extracción de Tema Particle
+wget -qO /tmp/grubtheme.tar.gz "$GRUB_THEME_URL" || true
+mkdir -p /usr/share/grub/themes/Particle-circle
+tar -xf /tmp/grubtheme.tar.gz --strip-components=1 -C /usr/share/grub/themes/Particle-circle/ || true
 
-    git clone --quiet https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle
-    cd /tmp/particle || true
-    chmod +x install.sh
-    ./install.sh -t window -s ${GRUB_SCREEN} || true
-    
-    echo "LANG=es_ES.UTF-8" >> /etc/default/grub
-    sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
-    
-    if grep -q '^GRUB_THEME=' /etc/default/grub; then
-        sed -i 's|^GRUB_THEME=.*|GRUB_THEME="/usr/share/grub/themes/Particle-circle-window/theme.txt"|' /etc/default/grub
-    else
-        echo 'GRUB_THEME="/usr/share/grub/themes/Particle-circle-window/theme.txt"' >> /etc/default/grub
-    fi
+sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
+# AMD P-State EPP Active inyectado para latencia ultra-baja
+CMD="quiet splash loglevel=3 amdgpu.ppfeaturemask=0xffffffff amd_pstate=active apparmor=1 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
+sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$CMD\"|" /etc/default/grub
+echo "GRUB_GFXMODE=$GRUB_GFXMODE" >> /etc/default/grub
+echo 'GRUB_THEME="/usr/share/grub/themes/Particle-circle/theme.txt"' >> /etc/default/grub
 
-    if grep -q '^GRUB_GFXMODE=' /etc/default/grub; then
-        sed -i "s|^GRUB_GFXMODE=.*|GRUB_GFXMODE=${GRUB_GFXMODE}|" /etc/default/grub
-    else
-        echo "GRUB_GFXMODE=${GRUB_GFXMODE}" >> /etc/default/grub
-    fi
-    grep -q '^GRUB_GFXPAYLOAD_LINUX=' /etc/default/grub || echo 'GRUB_GFXPAYLOAD_LINUX=keep' >> /etc/default/grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ICEMAN_OS
+grub-mkconfig -o /boot/grub/grub.cfg
 
-    CMD_LINE="quiet splash loglevel=3 amdgpu.ppfeaturemask=0xffffffff apparmor=1 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
-    sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${CMD_LINE}\"|" /etc/default/grub
+# I. SECURE BOOT AUTO-ENROLL
+sbctl create-keys
+sbctl sign -s /boot/vmlinuz-linux-cachyos || true
+sbctl sign -s /boot/efi/EFI/ICEMAN_OS/grubx64.efi || true
 
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ICEMAN_OS
-    grub-mkconfig -o /boot/grub/grub.cfg
-    
-    # --- SECURE BOOT (FIRMA DIGITAL + AUTO HOOK) ---
-    sbctl create-keys || true
-    sbctl sign -s /boot/efi/EFI/ICEMAN_OS/grubx64.efi || true
-    sbctl sign -s /boot/vmlinuz-linux-cachyos || true
-    
-    mkdir -p /etc/pacman.d/hooks
-    cat << 'SBHOOK' > /etc/pacman.d/hooks/99-secureboot.hook
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Type = Package
-Target = linux-cachyos
-Target = systemd
-[Action]
-Description = Re-firmando binarios para Secure Boot...
-When = PostTransaction
-Exec = /usr/bin/sbctl sign -s /boot/vmlinuz-linux-cachyos
-SBHOOK
-    
-    snapper --no-dbus -c root create --description "baseline-titanium-ultra-$(date +%F)" || true
-}
+cat << 'SBAUTO_SH' > /usr/local/bin/sb-auto-enroll.sh
+#!/bin/bash
+if sbctl status | grep -q "Setup Mode:.*Enabled"; then
+    sbctl enroll-keys -m
+    systemctl disable sb-auto-enroll.service
+    rm /etc/systemd/system/sb-auto-enroll.service /usr/local/bin/sb-auto-enroll.sh
+fi
+SBAUTO_SH
+chmod +x /usr/local/bin/sb-auto-enroll.sh
 
-task_11() {
-    printf '[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd\nswap-priority = 100\nfs-type = swap\n' > /etc/systemd/zram-generator.conf
-    
-    ufw default deny incoming && ufw default allow outgoing || true
-    systemctl enable ufw.service paccache.timer fstrim.timer
-    sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=50M/' /etc/systemd/journald.conf
+cat << 'SBAUTO_SRV' > /etc/systemd/system/sb-auto-enroll.service
+[Unit]
+Description=Iceman Secure Boot Auto-Enroll
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sb-auto-enroll.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+SBAUTO_SRV
 
-    sudo -u "$USERNAME" yay -Yc --noconfirm || true
-    sudo -u "$USERNAME" yay -Sc --noconfirm || true
-    paccache -r || true
+# J. MANTENIMIENTO ACTIVO (Snapper y ZSH)
+snapper --no-dbus -c root create-config /
+chmod 750 /.snapshots
+sed -i "s/^ALLOW_USERS=.*/ALLOW_USERS=\"$USERNAME\"/" /etc/snapper/configs/root
 
-    rm -f /etc/sudoers.d/99-iceman-install
-    
-    chown -R "$USERNAME:$USERNAME" /home/$USERNAME
-    chmod 700 /home/$USERNAME
-}
-EOF
+pacman -S --needed --noconfirm zsh fastfetch
+sudo -u "$USERNAME" git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /home/$USERNAME/.oh-my-zsh
+sudo -u "$USERNAME" bash -c "echo -e 'export ZSH=\"\$HOME/.oh-my-zsh\"\nZSH_THEME=\"robbyrussell\"\nplugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting)\nsource \$ZSH/oh-my-zsh.sh\nfastfetch -l cachyos' > /home/$USERNAME/.zshrc"
+chsh -s /usr/bin/zsh "$USERNAME"
+
+# K. ACTIVACIÓN DE SERVICIOS
+systemctl enable gdm NetworkManager bluetooth ufw apparmor ananicy-cpp reflector.timer
+systemctl enable grub-btrfsd systemd-zram-setup@zram0.service btrfs-scrub@-.timer snapper-timeline.timer
+systemctl enable input-remapper clean-shaders.timer iceman-health.service sb-auto-enroll.service
+
+# Limpieza Profunda
+rm -rf /tmp/yay-bin /tmp/iceman_assets /tmp/grubtheme.tar.gz
+paccache -rk1 || true
+CHROOT_EOF
+
+chmod +x /mnt/root/install_internal.sh
 
 # ==============================================================================
-# 6. TÚNEL DE EJECUCIÓN (CHROOT)
+# FASE 3: INYECCIÓN Y CIERRE
 # ==============================================================================
-TASK_LABELS=(
-    "[1/11] Forjando Identidad y Fix Polkit CoreCtrl"
-    "[2/11] Configurando Gestor Pacman"
-    "[3/11] Desplegando Motor AUR (Yay)"
-    "[4/11] Instalando Drivers AMD, Sysctl Gaming y Codecs"
-    "[5/11] Construyendo Ecosistema GNOME Nativo"
-    "[6/11] Inyectando Gaming Stack (xone, xpadneo, Flatpak)"
-    "[7/11] Desplegando Productividad y Gestión"
-    "[8/11] Inyectando Theming DCONF System-Wide"
-    "[9/11] Configurando Shell ZSH"
-    "[10/11] Sellando GRUB Particle, Secure Boot y Snapper"
-    "[11/11] Optimizando y Purgando Sistema"
-)
+run "Iniciando despliegue Chroot Nativo" "arch-chroot /mnt /root/install_internal.sh"
 
-for i in "${!TASK_LABELS[@]}"; do
-    N=$((i + 1))
-    run_task "${TASK_LABELS[$i]}" "arch-chroot /mnt bash -c 'source /iceman_chroot.sh && task_${N}'"
-done
+run "Sellando entorno y limpiando logs" "
+    rm -f /mnt/root/install_vars.sh /mnt/root/install_internal.sh
+    cp $LOG_FILE /mnt/var/log/iceman_ultra_install.log
+    umount -R /mnt
+"
 
-# ==============================================================================
-# 7. DESMONTAJE Y CIERRE
-# ==============================================================================
-trap - EXIT
-
-mkdir -p /mnt/var/log/
-cp "$LOG_FILE" /mnt/var/log/iceman-install.log 2>/dev/null || true
-cp "$ERR_LOG" /mnt/var/log/iceman-errors.log 2>/dev/null || true
-
-rm -f /mnt/iceman_chroot.sh /mnt/iceman.conf 2>/dev/null || true
-umount -R /mnt 2>/dev/null || true
-
-ELAPSED=$(( SECONDS - INSTALL_START ))
-echo -e "\n${C_GREEN}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_GREEN}║  TITANIUM ULTRA (v3.0 BAZZITE-LIKE)      ║${C_DEF}"
-echo -e "${C_GREEN}╠══════════════════════════════════════════╣${C_DEF}"
-printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Hostname"     "$HOSTNAME_PC"
-printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Usuario"      "$USERNAME"
-printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "GRUB"         "Particle Circle @ ${GRUB_SCREEN}"
-printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Perfil"       "$([ "$INSTALL_PROFILE" == "1" ] && echo 'Full Gaming Bazzite-like' || echo 'Desktop Limpio')"
-printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%d min %d seg${C_DEF}\n" "Tiempo total" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
-echo -e "${C_GREEN}╚══════════════════════════════════════════╝${C_DEF}"
-
-echo -e "\n${C_YELLOW}🚀 PASO FINAL: ACTIVAR SECURE BOOT${C_DEF}"
-echo -e "Tu sistema ha sido firmado digitalmente, pero tu placa base aún necesita reconocerlo."
-echo -e "Sigue estos 3 pasos antes de jugar:"
-echo -e "  ${C_CYAN}1.${C_DEF} Escribe 'reboot' y entra en la BIOS de tu equipo."
-echo -e "  ${C_CYAN}2.${C_DEF} Ve a Secure Boot y elige ${C_YELLOW}'Erase Keys'${C_DEF} o ${C_YELLOW}'Reset to Setup Mode'${C_DEF}."
-echo -e "  ${C_CYAN}3.${C_DEF} Inicia tu nuevo Iceman OS, abre una terminal y escribe este comando:"
-echo -e "     ${C_GREEN}sudo sbctl enroll-keys -m${C_DEF}"
-echo -e "     ${C_CYAN}(El '-m' es vital para no perder compatibilidad con Windows u otros sistemas)${C_DEF}"
-echo -e "\n¡Listo! Tu máquina de forja Titanium te espera. Escribe ${C_YELLOW}reboot${C_DEF} para arrancar."
+echo -e "\n\033[1;32m==============================================================\033[0m"
+echo -e "\033[1;32m   ICE-GNOME-ULTRA DESPLEGADO CON ÉXITO ABSOLUTO              \033[0m"
+echo -e "\033[1;32m==============================================================\033[0m"
+echo -e "\033[1;33m[i] AUTO-ENROLL PREPARADO:\033[0m"
+echo -e "Las llaves están creadas y el servicio 'oneshot' está armado."
+echo -e "Si reinicias y tu BIOS está en Setup Mode, el sistema registrará las llaves"
+echo -e "automáticamente y destruirá el script de registro para no dejar rastro."
+echo -e "¡Tu estación de combate te espera! Escribe 'reboot'."
