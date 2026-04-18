@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS - ICE-GNOME-ULTRA (v5.1 - ADAPTIVE MASTERPIECE)
+# ICEMAN OS - ICE-GNOME-ULTRA (v5.2 - BULLETPROOF ADAPTIVE)
 # Arquitectura: Clean Room + Hardware Awareness (Metal vs VM)
 # Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | VirtualBox Safe Mode
-# Contenido: 100% Core + 100% User-Space Apps + Gaming Sysctl
+# Fixes: Bootstrap Dinámico de Repositorios (No URLs estáticas, No 404)
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -17,7 +17,7 @@ print_success() { echo -e "\033[1;32m[✓] $1\033[0m"; }
 print_warning() { echo -e "\033[1;33m[!] $1\033[0m"; }
 print_error() { 
     echo -e "\n\033[1;31m[!] FATAL ERROR: $1\033[0m"
-    tail -n 20 "$LOG_FILE"
+    tail -n 25 "$LOG_FILE"
     exit 1
 }
 
@@ -143,12 +143,15 @@ run "Configurando Pacman en Host (Modo Seguro)" "
     pacman-key --populate archlinux
 "
 
-run "Inyectando repositorios CachyOS" "
+# FIX DE INYECCIÓN DE REPOSITORIO CACHYOS (Dinámico, sin versiones estáticas)
+run "Inyectando repositorios CachyOS Dinámicos" "
     pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
     pacman-key --lsign-key F3B607488DB35A47
-    pacman -U 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst' 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-18-1-any.pkg.tar.zst' --noconfirm
     sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf || true
-    printf '\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' >> /etc/pacman.conf
+    echo -e '\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n' >> /etc/pacman.conf
+    pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist
+    sed -i '/\[cachyos\]/,+2d' /etc/pacman.conf || true
+    echo -e '\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' >> /etc/pacman.conf
     pacman -Sy
 "
 
@@ -220,7 +223,7 @@ ENV_VARS
 # D. INSTALACIÓN DE MÓDULOS (AMD, UI, Multimedia Pro)
 PACMAN_CMD="pacman -S --needed --noconfirm"
 
-# D.1 Drivers Base (Siempre instalamos AMD para mantener el disco portable al Metal)
+# D.1 Drivers Base
 $PACMAN_CMD xf86-video-amdgpu mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver
 $PACMAN_CMD pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav bluez bluez-utils
 
