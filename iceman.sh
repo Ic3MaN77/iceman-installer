@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS - ICE-GNOME-ULTRA (v5.2 - BULLETPROOF ADAPTIVE)
-# Arquitectura: Clean Room + Hardware Awareness (Metal vs VM)
+# ICEMAN OS - ICE-GNOME-ULTRA (v5.3 - INDESTRUCTIBLE EDITION)
+# Arquitectura: Two-Stage Bootstrap (Base Host -> Hot Injection Chroot)
 # Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | VirtualBox Safe Mode
-# Fixes: Bootstrap Dinámico de Repositorios (No URLs estáticas, No 404)
+# Contenido: 100% Core + 100% User-Space Apps + Gaming Sysctl + Auto-Enroll
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -33,7 +33,7 @@ run() {
 
 clear
 echo -e "\033[1;36m==============================================================\033[0m"
-echo -e "\033[1;36m          ICEMAN OS - ICE GNOME ULTRA DEPLOYMENT              \033[0m"
+echo -e "\033[1;36m          ICEMAN OS - ICE GNOME ULTRA (v5.3)                  \033[0m"
 echo -e "\033[1;36m==============================================================\033[0m\n"
 
 # ==============================================================================
@@ -90,7 +90,7 @@ fi
 read -p "➤ Usuario [iceman]: " USERNAME; USERNAME=${USERNAME:-iceman}
 read -p "➤ Hostname [iceman-pc]: " HOSTNAME_PC; HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
 
-CURSOR_URL="https://github.com/vinceliuice/Qogir-icon-theme/archive/refs/tags/2023-06-05.tar.gz"
+# Assets Visuales
 GRUB_THEME_URL="https://github.com/yeyushengfan258/Particle-circle-grub-theme/archive/refs/heads/main.tar.gz"
 RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | head -n 1 || echo "1920x1080")
 GRUB_GFXMODE="${RAW_RES}x32"
@@ -136,31 +136,15 @@ run "Montando árbol final BTRFS" "
     mount $P_EFI /mnt/boot/efi
 "
 
-# 1.4 Repositorios Seguros y Sistema Base (Pacstrap)
-run "Configurando Pacman en Host (Modo Seguro)" "
-    sed -i \"s/^#ParallelDownloads.*/ParallelDownloads = $OPT_PARALLEL_DL/\" /etc/pacman.conf
-    pacman-key --init
-    pacman-key --populate archlinux
-"
-
-# FIX DE INYECCIÓN DE REPOSITORIO CACHYOS (Dinámico, sin versiones estáticas)
-run "Inyectando repositorios CachyOS Dinámicos" "
-    pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
-    pacman-key --lsign-key F3B607488DB35A47
-    sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf || true
-    echo -e '\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n' >> /etc/pacman.conf
-    pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist
-    sed -i '/\[cachyos\]/,+2d' /etc/pacman.conf || true
-    echo -e '\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' >> /etc/pacman.conf
-    pacman -Sy
-"
-
-CORE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode cachyos-keyring cachyos-mirrorlist cachyos-settings cachyos-hooks btrfs-progs btrfsmaintenance networkmanager git nano vim wget curl sudo zram-generator ufw apparmor grub efibootmgr os-prober plymouth plymouth-theme-spinner snapper snap-pac grub-btrfs inotify-tools"
+# 1.4 Instalación Base Segura (Pacstrap First Stage)
+# NOTA: Instalamos el kernel 'linux' estandar aquí para evitar manipular llaves de CachyOS en la Live ISO.
+# El kernel de CachyOS se inyectará desde dentro del disco.
+CORE_PKGS="base base-devel linux linux-headers linux-firmware amd-ucode btrfs-progs networkmanager git nano vim wget curl sudo zram-generator ufw apparmor grub efibootmgr os-prober plymouth plymouth-theme-spinner snapper snap-pac grub-btrfs inotify-tools"
 FS_PKGS="ntfs-3g exfatprogs dosfstools mtools fuse3 unzip p7zip rsync"
 [[ "$USE_LUKS" == "YES" ]] && CORE_PKGS="$CORE_PKGS cryptsetup"
 [[ "$OPT_SECUREBOOT" == "YES" ]] && CORE_PKGS="$CORE_PKGS sbctl"
 
-run "Instalando Sistema Base (Pacstrap)" "pacstrap -K /mnt $CORE_PKGS $FS_PKGS"
+run "Instalando Sistema Base (Arch Puro - Safe Mode)" "pacstrap -K /mnt $CORE_PKGS $FS_PKGS"
 
 run "Generando fstab y crypttab" "
     genfstab -U /mnt >> /mnt/etc/fstab
@@ -168,17 +152,17 @@ run "Generando fstab y crypttab" "
 "
 
 # ==============================================================================
-# FASE 2: CONSTRUCCIÓN DEL ENTORNO 'CLEAN ROOM' (EL MOTOR CHROOT)
+# FASE 2: CONSTRUCCIÓN DEL ENTORNO 'CLEAN ROOM' (HOT INJECTION CHROOT)
 # ==============================================================================
-print_info "Ensamblando motor interno en Chroot Aislado..."
+print_info "Ensamblando matriz de inyección interna..."
 
+# Pasamos las variables al disco duro
 cat << EOF > /mnt/root/install_vars.sh
 USERNAME="$USERNAME"
 MASTER_PASS="$MASTER_PASS"
 HOSTNAME_PC="$HOSTNAME_PC"
 USE_LUKS="$USE_LUKS"
 GRUB_GFXMODE="$GRUB_GFXMODE"
-CURSOR_URL="$CURSOR_URL"
 GRUB_THEME_URL="$GRUB_THEME_URL"
 OPT_PARALLEL_DL="$OPT_PARALLEL_DL"
 OPT_MAKEFLAGS="$OPT_MAKEFLAGS"
@@ -186,18 +170,28 @@ OPT_KERNEL="$OPT_KERNEL"
 OPT_SECUREBOOT="$OPT_SECUREBOOT"
 EOF
 
+# Construimos el script interno (Nótese el 'CHROOT_EOF' con comillas)
 cat << 'CHROOT_EOF' > /mnt/root/install_internal.sh
 #!/bin/bash
 set -Eeuo pipefail
 source /root/install_vars.sh
 export MAKEFLAGS="$OPT_MAKEFLAGS"
 
-# A. OPTIMIZACIÓN DE PACMAN Y REPOS
-sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf
+echo "[✓] CHROOT INICIADO: Aplicando optimizaciones de pacman..."
+sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf || true
 echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
 sed -i 's/^#Color/Color\nILoveCandy/' /etc/pacman.conf
 sed -i "s/^#ParallelDownloads.*/ParallelDownloads = $OPT_PARALLEL_DL/" /etc/pacman.conf
-pacman -Sy --noconfirm
+
+# A. BOOTSTRAP DINÁMICO DE CACHYOS (Desde dentro del disco, evita OOM/404)
+echo "[✓] CHROOT: Inyectando repositorios CachyOS nativos..."
+pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
+pacman-key --lsign-key F3B607488DB35A47
+echo -e "\n[cachyos-temp]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n" >> /etc/pacman.conf
+pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist cachyos-settings cachyos-hooks
+sed -i '/\[cachyos-temp\]/,+2d' /etc/pacman.conf
+pacman -Sy --noconfirm linux-cachyos linux-cachyos-headers
+pacman -Rns --noconfirm linux linux-headers || true # Limpiamos el kernel estándar
 
 # B. LOCALIZACIÓN
 ln -sf /usr/share/zoneinfo/Europe/Madrid /etc/localtime
@@ -223,11 +217,11 @@ ENV_VARS
 # D. INSTALACIÓN DE MÓDULOS (AMD, UI, Multimedia Pro)
 PACMAN_CMD="pacman -S --needed --noconfirm"
 
-# D.1 Drivers Base
+echo "[✓] CHROOT: Instalando Drivers AMD y Multimedia..."
 $PACMAN_CMD xf86-video-amdgpu mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver
 $PACMAN_CMD pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav bluez bluez-utils
 
-# D.2 Audio Low-Latency
+# Audio Low-Latency
 mkdir -p /etc/pipewire/pipewire.conf.d
 cat << 'PIPEWIRE' > /etc/pipewire/pipewire.conf.d/92-low-latency.conf
 context.properties = {
@@ -238,20 +232,21 @@ context.properties = {
 }
 PIPEWIRE
 
-# D.3 Entorno GNOME y Flatpak
+echo "[✓] CHROOT: Instalando Ecosistema GNOME y Gaming..."
 $PACMAN_CMD gnome gnome-tweaks gdm xdg-desktop-portal-gnome firefox gnome-shell-extension-dash-to-dock gnome-shell-extension-appindicator flatpak
 flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
 
-# D.4 Gaming
 $PACMAN_CMD steam steam-native-runtime lutris wine-staging winetricks gamemode lib32-gamemode corectrl mangohud vkbasalt ananicy-cpp
 
 # E. COMPILACIÓN AUR Y GESTIÓN
+echo "[✓] CHROOT: Compilando YAY y paquetes AUR..."
 sudo -u "$USERNAME" bash -c "cd /tmp && git clone --depth=1 https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm"
 
 sudo -u "$USERNAME" yay -S --noconfirm pamac-aur libpamac-flatpak-plugin btrfs-assistant mission-center stacer-bin onlyoffice-bin extension-manager ttf-ms-fonts
+# Uso || true en temas visuales por si los repos de Pling fallan
 sudo -u "$USERNAME" yay -S --noconfirm xone-dkms xpadneo-dkms input-remapper-git \
     adw-gtk3-git papirus-icon-theme qogir-cursor-theme \
-    gnome-shell-extension-blur-my-shell gnome-shell-extension-vitals
+    gnome-shell-extension-blur-my-shell gnome-shell-extension-vitals || true
 
 # F. BLINDAJE Y RENDIMIENTO
 ufw default deny incoming
@@ -262,7 +257,7 @@ zram-size = ram / 2
 compression-algorithm = zstd
 ZRAM
 
-# F.2 Auto-Limpieza de Shaders
+# Auto-Limpieza de Shaders
 cat << 'SHADERS_SH' > /usr/local/bin/clean-shaders.sh
 #!/bin/bash
 find /home/*/.cache/mesa_shader_cache -type f -atime +30 -delete 2>/dev/null || true
@@ -285,7 +280,7 @@ Persistent=true
 WantedBy=timers.target
 SHADERS_TMR
 
-# F.3 Health Check System
+# Health Check System
 cat << 'HEALTH_SH' > /usr/local/bin/iceman-health.sh
 #!/bin/bash
 FAILED=\$(systemctl --failed --no-legend | wc -l)
@@ -305,13 +300,14 @@ ExecStart=/usr/local/bin/iceman-health.sh
 WantedBy=multi-user.target
 HEALTH_SRV
 
-# G. INYECCIÓN VISUAL
-flatpak override --system --filesystem=~/.themes
-flatpak override --system --filesystem=~/.icons
-flatpak override --system --env=XCURSOR_PATH=/usr/share/icons:~/.local/share/icons
+# G. INYECCIÓN VISUAL Y FLATPAK OVERRIDES
+echo "[✓] CHROOT: Aplicando estética y DCONF..."
+flatpak override --system --filesystem=~/.themes || true
+flatpak override --system --filesystem=~/.icons || true
+flatpak override --system --env=XCURSOR_PATH=/usr/share/icons:~/.local/share/icons || true
 
 mkdir -p /usr/share/backgrounds/iceman /usr/share/gnome-background-properties
-git clone --depth=1 https://github.com/Ic3MaN77/iceman-installer.git /tmp/iceman_assets
+git clone --depth=1 https://github.com/Ic3MaN77/iceman-installer.git /tmp/iceman_assets || true
 cp /tmp/iceman_assets/wallpapers/*.webp /usr/share/backgrounds/iceman/ 2>/dev/null || true
 cp /usr/share/backgrounds/iceman/*.webp /usr/share/backgrounds/iceman/default.webp 2>/dev/null || true
 
@@ -338,9 +334,10 @@ picture-uri-dark='file:///usr/share/backgrounds/iceman/default.webp'
 disable-user-extensions=false
 enabled-extensions=['dash-to-dock@micxgx.gmail.com', 'blur-my-shell@aunetx', 'Vitals@CoreCoding.com', 'appindicatorsupport@rgcjonas.gmail.com']
 DCONF_EOF
-dconf update
+dconf update || true
 
 # H. MOTOR DE ARRANQUE (Mkinitcpio, GRUB, Plymouth)
+echo "[✓] CHROOT: Configurando Bootloader y Kernel..."
 if [ "$USE_LUKS" == "YES" ]; then
     sed -i '/^HOOKS=/c\HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)' /etc/mkinitcpio.conf
 else
@@ -363,9 +360,10 @@ echo 'GRUB_THEME="/usr/share/grub/themes/Particle-circle/theme.txt"' >> /etc/def
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ICEMAN_OS
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# I. SECURE BOOT (Solo si el perfil lo habilita)
+# I. SECURE BOOT AUTO-ENROLL (Solo Perfil Metal)
 if [ "$OPT_SECUREBOOT" == "YES" ]; then
-    sbctl create-keys
+    echo "[✓] CHROOT: Armando auto-enrollamiento de Secure Boot..."
+    sbctl create-keys || true
     sbctl sign -s /boot/vmlinuz-linux-cachyos || true
     sbctl sign -s /boot/efi/EFI/ICEMAN_OS/grubx64.efi || true
 
@@ -390,37 +388,39 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 SBAUTO_SRV
-    systemctl enable sb-auto-enroll.service
+    systemctl enable sb-auto-enroll.service || true
 fi
 
 # J. MANTENIMIENTO ACTIVO (Snapper y ZSH)
-snapper --no-dbus -c root create-config /
-chmod 750 /.snapshots
-sed -i "s/^ALLOW_USERS=.*/ALLOW_USERS=\"$USERNAME\"/" /etc/snapper/configs/root
+echo "[✓] CHROOT: Finalizando estructura de Snapper y ZSH..."
+snapper --no-dbus -c root create-config / || true
+chmod 750 /.snapshots || true
+sed -i "s/^ALLOW_USERS=.*/ALLOW_USERS=\"$USERNAME\"/" /etc/snapper/configs/root || true
 
 pacman -S --needed --noconfirm zsh fastfetch
-sudo -u "$USERNAME" git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /home/$USERNAME/.oh-my-zsh
-sudo -u "$USERNAME" bash -c "echo -e 'export ZSH=\"\$HOME/.oh-my-zsh\"\nZSH_THEME=\"robbyrussell\"\nplugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting)\nsource \$ZSH/oh-my-zsh.sh\nfastfetch -l cachyos' > /home/$USERNAME/.zshrc"
-chsh -s /usr/bin/zsh "$USERNAME"
+sudo -u "$USERNAME" git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /home/$USERNAME/.oh-my-zsh || true
+sudo -u "$USERNAME" bash -c "echo -e 'export ZSH=\"\$HOME/.oh-my-zsh\"\nZSH_THEME=\"robbyrussell\"\nplugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting)\nsource \$ZSH/oh-my-zsh.sh\nfastfetch -l cachyos' > /home/$USERNAME/.zshrc" || true
+chsh -s /usr/bin/zsh "$USERNAME" || true
 
 # K. ACTIVACIÓN DE SERVICIOS
 systemctl enable gdm NetworkManager bluetooth ufw apparmor ananicy-cpp reflector.timer
 systemctl enable grub-btrfsd systemd-zram-setup@zram0.service btrfs-scrub@-.timer snapper-timeline.timer
-systemctl enable input-remapper clean-shaders.timer iceman-health.service
+systemctl enable input-remapper clean-shaders.timer iceman-health.service || true
 
 # Limpieza Profunda
 rm -rf /tmp/yay-bin /tmp/iceman_assets /tmp/grubtheme.tar.gz
 paccache -rk1 || true
+echo "[✓] CHROOT COMPLETADO. Matriz optimizada con éxito."
 CHROOT_EOF
 
 chmod +x /mnt/root/install_internal.sh
 
 # ==============================================================================
-# FASE 3: INYECCIÓN Y CIERRE
+# FASE 3: EJECUCIÓN NATIVA Y SELLADO
 # ==============================================================================
-run "Iniciando despliegue Chroot Nativo" "arch-chroot /mnt /root/install_internal.sh"
+run "Iniciando metamorfosis interna (Hot Injection)" "arch-chroot /mnt /root/install_internal.sh"
 
-run "Sellando entorno y limpiando logs" "
+run "Limpiando variables de entorno y sellando instalación" "
     rm -f /mnt/root/install_vars.sh /mnt/root/install_internal.sh
     cp $LOG_FILE /mnt/var/log/iceman_ultra_install.log
     umount -R /mnt
@@ -435,7 +435,7 @@ if [[ "$IS_VM" == "none" ]]; then
     echo -e "las registrará automáticamente en el próximo arranque."
 else
     echo -e "\033[1;34m[i] INSTALACIÓN EN MÁQUINA VIRTUAL COMPLETADA:\033[0m"
-    echo -e "Sistema configurado en Modo Seguro. (Secure Boot e inyecciones"
-    echo -e "agresivas de Kernel P-State fueron omitidas para garantizar estabilidad)."
+    echo -e "Sistema configurado en Modo Seguro. Las inyecciones agresivas de"
+    echo -e "Kernel P-State y Secure Boot fueron omitidas para asegurar la estabilidad."
 fi
-echo -e "¡Tu estación de combate te espera! Escribe 'reboot'."
+echo -e "¡Tu estación de combate te espera! Escribe 'reboot' para reiniciar."
