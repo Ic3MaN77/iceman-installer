@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS ARCHITECT - TITANIUM HYPRLAND + CAELESTIA SHELL EDITION (v9.1)
+# ICEMAN OS ARCHITECT - TITANIUM HYPRLAND + CAELESTIA SHELL EDITION (v10.0)
 # Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | Entornos VM (KVM/VBox)
-# Fixes: LUKS2 Boot Loop, Btrfs Mounts, VM Video Drivers, mkinitcpio Hook Order
+# Features: BTRFS, LUKS2 Fix, CachyOS, AGS, SDDM Dark, Daily Suite & AMD Gaming
 # ==============================================================================
 set +e 
 
@@ -31,9 +31,9 @@ echo -e "${C_PURPLE}======================================================${C_DE
 IS_VM=$(systemd-detect-virt || echo "none")
 if [[ "$IS_VM" != "none" ]]; then
     echo -e "${C_YELLOW}[!] Entorno de Virtualización Detectado: $IS_VM${C_DEF}"
-    echo -e "${C_YELLOW}[!] Se activarán protocolos de rescate (Nomodeset, No-Quiet, Soft-GPU).${C_DEF}\n"
+    echo -e "${C_YELLOW}[!] Se usarán drivers virtuales (Wayland KMS activo, sin nomodeset).${C_DEF}\n"
 else
-    echo -e "${C_CYAN}[!] Entorno Bare Metal Detectado. Activando máxima aceleración AMD.${C_DEF}\n"
+    echo -e "${C_CYAN}[!] Entorno Bare Metal Detectado. Activando máxima aceleración AMD y Gaming.${C_DEF}\n"
 fi
 
 # ── Saneamiento y Seguridad ────────────────────────────────────────────────────
@@ -84,7 +84,6 @@ done
 
 HOSTNAME_PC="iceman-titan"
 
-# Detección de resolución para GRUB y SDDM
 RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | grep -v '^i' | sort -t'x' -k2 -n | tail -1 || echo "1920x1080")
 case "$RAW_RES" in
     3840x2160*) GRUB_SCREEN="4k"; GRUB_GFXMODE="3840x2160x32" ;;
@@ -142,7 +141,7 @@ run_task() {
     fi
 }
 
-# ── TAREA 1: Cirugía de Disco (BTRFS + LUKS) ──────────────────────────────────
+# ── TAREA 1: Cirugía de Disco (BTRFS + LUKS FIX) ──────────────────────────────
 disk_setup() {
     umount -A -R /mnt 2>/dev/null || true
     cryptsetup close cryptroot 2>/dev/null || true
@@ -161,7 +160,7 @@ disk_setup() {
         echo -n "$LUKS_PASS1" | cryptsetup luksFormat --type luks2 "$P2" -
         echo -n "$LUKS_PASS1" | cryptsetup open "$P2" cryptroot -
         T_ROOT="/dev/mapper/cryptroot"
-        # Extracción vital del UUID físico para el arranque
+        # FIX: Extracción del UUID Físico para el GRUB
         CRYPT_UUID=$(blkid -s UUID -o value "$P2")
     else
         T_ROOT="$P2"
@@ -193,7 +192,7 @@ pacstrap_base() {
 
     BASE_PKGS="base base-devel linux linux-headers linux-firmware btrfs-progs nano vim git networkmanager grub efibootmgr os-prober ufw sudo zram-generator wget curl unzip jq"
     
-    # Solo instalar microcódigo AMD si es Bare Metal
+    # Solo cargar microcódigo AMD en Bare Metal para evitar conflictos en VM
     [[ "$IS_VM" == "none" ]] && BASE_PKGS+=" amd-ucode"
     [[ "$USE_LUKS" == "YES" ]] && BASE_PKGS+=" cryptsetup"
 
@@ -240,10 +239,13 @@ task_1() {
 
 task_2() {
     pacman-key --init && pacman-key --populate archlinux
+    
+    # Activar multilib para Gaming (Steam/Lutris)
     sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
     sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
     sed -i 's/^#Color/Color\nILoveCandy/' /etc/pacman.conf
 
+    # Repos CachyOS
     pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keyserver.ubuntu.com
     pacman-key --lsign-key F3B607488DB35A47
     echo -e "\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n" >> /etc/pacman.conf
@@ -259,18 +261,25 @@ task_3() {
 }
 
 task_4() {
+    # Drivers e Infraestructura de Video (KMS es Obligatorio para Wayland)
     if [[ "$IS_VM" != "none" ]]; then
         install_pacman xf86-video-vmware xf86-video-qxl qemu-guest-agent mesa
+        # Renderizado por software como red de seguridad
         echo -e "WLR_NO_HARDWARE_CURSORS=1\nWLR_RENDERER_ALLOW_SOFTWARE=1\nLIBGL_ALWAYS_SOFTWARE=1" > /etc/environment
         systemctl enable qemu-guest-agent || true
     else
-        install_pacman mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu
+        # Pila Bare Metal + Gaming Stack AMD
+        install_pacman mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu vulkan-icd-loader lib32-vulkan-icd-loader
+        install_pacman gamemode lib32-gamemode wine-staging giflib lib32-giflib libpng lib32-libpng libldap lib32-libldap gnutls lib32-gnutls mpg123 lib32-mpg123 openal lib32-openal v4l-utils lib32-v4l-utils libpulse lib32-libpulse sqlite lib32-sqlite
+        
+        # Optimizaciones de Kernel CachyOS para red y memoria
         echo -e "vm.max_map_count=2147483642\nnet.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=fq_pie" > /etc/sysctl.d/99-gaming.conf
     fi
     install_pacman hyprland xdg-desktop-portal-hyprland xdg-desktop-portal-gtk polkit-gnome qt5-wayland qt6-wayland
 }
 
 task_5() {
+    # Motor Caelestia Shell (AGS) y Herramientas Visuales
     install_pacman npm nodejs dart-sass fd ripgrep fzf hyprpicker slurp grim wl-clipboard brightnessctl pamixer pavucontrol ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols noto-fonts-emoji
     install_aur aylurs-gtk-shell swww matugen-bin hyprshot
 }
@@ -300,6 +309,10 @@ HYPR
 }
 
 task_7() {
+    # Pila de Software Cotidiano y Configuración Hyprland
+    install_pacman kitty nautilus firefox discord telegram-desktop file-roller evince eog gvfs gvfs-mtp xdg-user-dirs
+    sudo -u "$USERNAME" xdg-user-dirs-update
+
     mkdir -p /home/${USERNAME}/.config/{hypr,ags}
     cat > /home/${USERNAME}/.config/hypr/hyprland.conf << 'HYPRCONF'
 monitor=,preferred,auto,1
@@ -331,10 +344,10 @@ $mainMod = SUPER
 bind = $mainMod, Return, exec, kitty
 bind = $mainMod, Q, killactive, 
 bind = $mainMod, M, exit, 
+bind = $mainMod, E, exec, nautilus
 bind = $mainMod, Space, exec, ags -t applauncher
 HYPRCONF
 
-    install_pacman kitty nautilus firefox
     chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config
 }
 
@@ -352,7 +365,7 @@ task_9() {
 }
 
 task_10() {
-    # mkinitcpio quirúrgico: Orden estricto (teclado -> cifrado -> btrfs)
+    # FIX: Orden estricto de Hooks (teclado -> cifrado -> btrfs)
     if [[ "$IS_VM" != "none" ]]; then
         MODS="btrfs qxl virtio_gpu"
     else
@@ -374,15 +387,12 @@ task_10() {
     # Construcción dinámica de la línea del Kernel
     CMD_LINE="loglevel=3 apparmor=1 rootflags=subvol=@"
     
-    # Inyectar el candado físico si hay LUKS
     if [[ "$USE_LUKS" == "YES" ]]; then
         CMD_LINE="${CMD_LINE} cryptdevice=UUID=${CRYPT_UUID}:cryptroot root=/dev/mapper/cryptroot"
     fi
 
-    # Lógica VM vs Bare Metal para el GRUB
-    if [[ "$IS_VM" != "none" ]]; then
-        CMD_LINE="${CMD_LINE} nomodeset" # Sin 'quiet' y forzando TTY visible
-    else
+    # FIX Wayland: NUNCA usar nomodeset, Wayland necesita KMS.
+    if [[ "$IS_VM" == "none" ]]; then
         CMD_LINE="${CMD_LINE} quiet amdgpu.ppfeaturemask=0xffffffff"
     fi
 
@@ -396,8 +406,26 @@ task_10() {
 }
 
 task_11() {
+    # Pila de Mantenimiento y Hardening
     printf '[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd\n' > /etc/systemd/zram-generator.conf
     systemctl enable ufw.service fstrim.timer
+    
+    # Hook de autolimpieza de pacman (guarda solo las últimas 2 versiones)
+    mkdir -p /etc/pacman.d/hooks
+    cat > /etc/pacman.d/hooks/clean_package_cache.hook << 'HOOK'
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Limpiando cache de paquetes vieja...
+When = PostTransaction
+Exec = /usr/bin/paccache -r -k 2
+HOOK
+
     sudo -u "$USERNAME" yay -Sc --noconfirm || true
     rm -f /etc/sudoers.d/99-iceman
 }
@@ -407,16 +435,16 @@ chmod +x /mnt/iceman_chroot.sh
 # ── Ejecución ─────────────────────────────────────────────────────────────────
 TASK_LABELS=(
     "Forjando Identidad de Usuario"
-    "Configurando CachyOS Core"
+    "Configurando CachyOS Core y Multilib"
     "Desplegando Motor AUR (Yay)"
-    "Instalando Drivers y Wayland / Hyprland"
+    "Instalando Drivers, Wayland y Gaming Stack"
     "Inyectando Ecosistema AGS (Caelestia Core)"
     "Instalando SDDM Pure Dark Theme"
-    "Infiltrando Dotfiles y Configuración Maestra"
-    "Activando Pipewire y Servicios"
+    "Infiltrando Dotfiles y Pila Cotidiana"
+    "Activando Pipewire y Servicios de Red"
     "Configurando Shell ZSH (Powerlevel10k)"
-    "Sellando GRUB Particle y mkinitcpio"
-    "Purgando y Optimizando"
+    "Sellando GRUB Particle y mkinitcpio (Fix LUKS)"
+    "Activando Autolimpieza y Optimizaciones"
 )
 
 for i in "${!TASK_LABELS[@]}"; do
@@ -430,11 +458,11 @@ rm -f /mnt/iceman_chroot.sh /mnt/iceman.conf 2>/dev/null || true
 umount -R /mnt 2>/dev/null || true
 
 echo -e "\n${C_PURPLE}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_PURPLE}║  TITANIUM HYPRLAND EDITION (v9.1)        ║${C_DEF}"
+echo -e "${C_PURPLE}║  TITANIUM HYPRLAND EDITION (v10.0)       ║${C_DEF}"
 echo -e "${C_PURPLE}╠══════════════════════════════════════════╣${C_DEF}"
-printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Entorno"      "$([ "$IS_VM" != "none" ] && echo 'Virtual Machine' || echo 'Bare Metal AMD')"
-printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Seguridad"    "$([ "$USE_LUKS" == "YES" ] && echo 'LUKS2 + Btrfs' || echo 'Btrfs Directo')"
-printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Compositor"   "Hyprland (CachyOS Git)"
+printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Entorno"      "$([ "$IS_VM" != "none" ] && echo 'Virtual Machine (KMS Activo)' || echo 'Bare Metal AMD')"
+printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Seguridad"    "$([ "$USE_LUKS" == "YES" ] && echo 'LUKS2 Fix + Btrfs' || echo 'Btrfs Directo')"
+printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Apps/Gaming"  "Suite Cotidiana + Wine/Gamemode"
 echo -e "${C_PURPLE}╚══════════════════════════════════════════╝${C_DEF}"
 
-echo -e "\n${C_GREEN}¡Instalación completada! Escribe 'reboot' para entrar al nuevo mundo.${C_DEF}"
+echo -e "\n${C_GREEN}¡Instalación completada! Asegúrate de tener Aceleración 3D en tu VM y escribe 'reboot'.${C_DEF}"
