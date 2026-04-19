@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS ARCHITECT - TITANIUM HYPRLAND + CAELESTIA SHELL EDITION (v9.0)
+# ICEMAN OS ARCHITECT - TITANIUM HYPRLAND + CAELESTIA SHELL EDITION (v9.1)
 # Target: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT | Entornos VM (KVM/VBox)
-# Contenido: BTRFS, LUKS2, CachyOS, Hyprland, AGS, SDDM Dark, Dotfiles Injection
+# Fixes: LUKS2 Boot Loop, Btrfs Mounts, VM Video Drivers, mkinitcpio Hook Order
 # ==============================================================================
 set +e 
 
@@ -31,7 +31,7 @@ echo -e "${C_PURPLE}======================================================${C_DE
 IS_VM=$(systemd-detect-virt || echo "none")
 if [[ "$IS_VM" != "none" ]]; then
     echo -e "${C_YELLOW}[!] Entorno de Virtualización Detectado: $IS_VM${C_DEF}"
-    echo -e "${C_YELLOW}[!] Se activarán protocolos de compatibilidad Wayland (Software Cursors).${C_DEF}\n"
+    echo -e "${C_YELLOW}[!] Se activarán protocolos de rescate (Nomodeset, No-Quiet, Soft-GPU).${C_DEF}\n"
 else
     echo -e "${C_CYAN}[!] Entorno Bare Metal Detectado. Activando máxima aceleración AMD.${C_DEF}\n"
 fi
@@ -161,8 +161,11 @@ disk_setup() {
         echo -n "$LUKS_PASS1" | cryptsetup luksFormat --type luks2 "$P2" -
         echo -n "$LUKS_PASS1" | cryptsetup open "$P2" cryptroot -
         T_ROOT="/dev/mapper/cryptroot"
+        # Extracción vital del UUID físico para el arranque
+        CRYPT_UUID=$(blkid -s UUID -o value "$P2")
     else
         T_ROOT="$P2"
+        CRYPT_UUID=""
     fi
 
     mkfs.btrfs -f -L ICEMAN_OS "$T_ROOT"
@@ -182,19 +185,22 @@ disk_setup() {
 }
 run_task "Purgando Sectores y Particionando (BTRFS)" "disk_setup"
 
-# ── TAREA 2: Pacstrap Base ────────────────────────────────────────────────────
+# ── TAREA 2: Pacstrap Base (VM Aware) ─────────────────────────────────────────
 pacstrap_base() {
     mkdir -p /mnt/etc
     echo 'KEYMAP=es' > /mnt/etc/vconsole.conf
     echo 'LANG=es_ES.UTF-8' > /mnt/etc/locale.conf
 
-    BASE_PKGS="base base-devel linux linux-headers linux-firmware amd-ucode btrfs-progs nano vim git networkmanager grub efibootmgr os-prober ufw sudo zram-generator wget curl unzip jq"
+    BASE_PKGS="base base-devel linux linux-headers linux-firmware btrfs-progs nano vim git networkmanager grub efibootmgr os-prober ufw sudo zram-generator wget curl unzip jq"
+    
+    # Solo instalar microcódigo AMD si es Bare Metal
+    [[ "$IS_VM" == "none" ]] && BASE_PKGS+=" amd-ucode"
     [[ "$USE_LUKS" == "YES" ]] && BASE_PKGS+=" cryptsetup"
 
     pacstrap -K /mnt ${BASE_PKGS}
     genfstab -U /mnt >> /mnt/etc/fstab
     sed -i 's/subvolid=[0-9]*,//g' /mnt/etc/fstab
-    [[ "$USE_LUKS" == "YES" ]] && echo "cryptroot UUID=$(blkid -s UUID -o value "$P2") none luks,discard" > /mnt/etc/crypttab || true
+    [[ "$USE_LUKS" == "YES" ]] && echo "cryptroot UUID=$CRYPT_UUID none luks,discard" > /mnt/etc/crypttab || true
 }
 run_task "Inyectando Sistema Base Arch" "pacstrap_base"
 
@@ -203,6 +209,7 @@ cat > /mnt/iceman.conf << CONFIG
 USERNAME="${USERNAME}"
 USER_PASS1="${USER_PASS1}"
 USE_LUKS="${USE_LUKS}"
+CRYPT_UUID="${CRYPT_UUID}"
 HOSTNAME_PC="${HOSTNAME_PC}"
 IS_VM="${IS_VM}"
 GRUB_GFXMODE="${GRUB_GFXMODE}"
@@ -237,7 +244,6 @@ task_2() {
     sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
     sed -i 's/^#Color/Color\nILoveCandy/' /etc/pacman.conf
 
-    # Repositorios CachyOS
     pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keyserver.ubuntu.com
     pacman-key --lsign-key F3B607488DB35A47
     echo -e "\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n" >> /etc/pacman.conf
@@ -253,7 +259,6 @@ task_3() {
 }
 
 task_4() {
-    # Drivers Inteligentes (VM vs Bare Metal)
     if [[ "$IS_VM" != "none" ]]; then
         install_pacman xf86-video-vmware xf86-video-qxl qemu-guest-agent mesa
         echo -e "WLR_NO_HARDWARE_CURSORS=1\nWLR_RENDERER_ALLOW_SOFTWARE=1\nLIBGL_ALWAYS_SOFTWARE=1" > /etc/environment
@@ -262,22 +267,17 @@ task_4() {
         install_pacman mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu
         echo -e "vm.max_map_count=2147483642\nnet.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=fq_pie" > /etc/sysctl.d/99-gaming.conf
     fi
-
-    # Display Server Wayland Nativo
     install_pacman hyprland xdg-desktop-portal-hyprland xdg-desktop-portal-gtk polkit-gnome qt5-wayland qt6-wayland
 }
 
 task_5() {
-    # Caelestia Shell Core (AGS) y Dependencias Visuales
     install_pacman npm nodejs dart-sass fd ripgrep fzf hyprpicker slurp grim wl-clipboard brightnessctl pamixer pavucontrol ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols noto-fonts-emoji
     install_aur aylurs-gtk-shell swww matugen-bin hyprshot
 }
 
 task_6() {
-    # SDDM Pure Dark & Gestor de Sesión
     install_pacman sddm qt5-graphicaleffects qt5-svg qt5-quickcontrols2
     systemctl enable sddm
-    
     install_aur sddm-theme-catppuccin
     mkdir -p /etc/sddm.conf.d/
     cat > /etc/sddm.conf.d/theme.conf << 'SDDM'
@@ -300,10 +300,7 @@ HYPR
 }
 
 task_7() {
-    # Dotfiles Infiltration: Preparando el terreno para Caelestia
     mkdir -p /home/${USERNAME}/.config/{hypr,ags}
-    
-    # Auto-generamos un Hyprland Master Config seguro y estilizado
     cat > /home/${USERNAME}/.config/hypr/hyprland.conf << 'HYPRCONF'
 monitor=,preferred,auto,1
 
@@ -325,43 +322,16 @@ general {
 
 decoration {
     rounding = 10
-    blur {
-        enabled = true
-        size = 3
-        passes = 1
-    }
-    drop_shadow = yes
-    shadow_range = 4
-    shadow_render_power = 3
-    col.shadow = rgba(1a1a1aee)
+    blur { enabled = true; size = 3; passes = 1; }
 }
 
-animations {
-    enabled = yes
-    bezier = myBezier, 0.05, 0.9, 0.1, 1.05
-    animation = windows, 1, 7, myBezier
-    animation = windowsOut, 1, 7, default, popin 80%
-    animation = border, 1, 10, default
-    animation = workspaces, 1, 6, default
-}
+animations { enabled = yes; }
 
-dwindle {
-    pseudotile = yes
-    preserve_split = yes
-}
-
-# Keybindings
 $mainMod = SUPER
 bind = $mainMod, Return, exec, kitty
 bind = $mainMod, Q, killactive, 
 bind = $mainMod, M, exit, 
-bind = $mainMod, E, exec, nautilus
-bind = $mainMod, V, togglefloating, 
 bind = $mainMod, Space, exec, ags -t applauncher
-bind = $mainMod, left, movefocus, l
-bind = $mainMod, right, movefocus, r
-bind = $mainMod, up, movefocus, u
-bind = $mainMod, down, movefocus, d
 HYPRCONF
 
     install_pacman kitty nautilus firefox
@@ -369,13 +339,11 @@ HYPRCONF
 }
 
 task_8() {
-    # Audio, Red y Utilidades Core
     install_pacman pipewire pipewire-audio pipewire-pulse pipewire-alsa pipewire-jack wireplumber bluez bluez-utils
     systemctl enable bluetooth NetworkManager
 }
 
 task_9() {
-    # ZSH Titanium
     pacman -S --noconfirm zsh fastfetch
     sudo -u "$USERNAME" sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended || true
     sudo -u "$USERNAME" git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "/home/${USERNAME}/.oh-my-zsh/custom/themes/powerlevel10k" || true
@@ -384,12 +352,13 @@ task_9() {
 }
 
 task_10() {
-    # mkinitcpio y GRUB Particle Secure
+    # mkinitcpio quirúrgico: Orden estricto (teclado -> cifrado -> btrfs)
     if [[ "$IS_VM" != "none" ]]; then
-        sed -i 's/^MODULES=()/MODULES=(btrfs qxl virtio_gpu)/' /etc/mkinitcpio.conf
+        MODS="btrfs qxl virtio_gpu"
     else
-        sed -i 's/^MODULES=()/MODULES=(btrfs amdgpu)/' /etc/mkinitcpio.conf
+        MODS="btrfs amdgpu"
     fi
+    sed -i "s/^MODULES=()/MODULES=(${MODS})/" /etc/mkinitcpio.conf
 
     if [[ "$USE_LUKS" == "YES" ]]; then
         sed -i 's/^HOOKS=(.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)/' /etc/mkinitcpio.conf
@@ -400,11 +369,23 @@ task_10() {
 
     git clone --quiet https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle
     cd /tmp/particle && chmod +x install.sh && ./install.sh -t window -s "${GRUB_SCREEN}" || true
-    
     echo 'GRUB_THEME="/usr/share/grub/themes/Particle-circle-window/theme.txt"' >> /etc/default/grub
     
-    CMD_LINE="quiet loglevel=3 apparmor=1"
-    [[ "$IS_VM" == "none" ]] && CMD_LINE="${CMD_LINE} amdgpu.ppfeaturemask=0xffffffff"
+    # Construcción dinámica de la línea del Kernel
+    CMD_LINE="loglevel=3 apparmor=1 rootflags=subvol=@"
+    
+    # Inyectar el candado físico si hay LUKS
+    if [[ "$USE_LUKS" == "YES" ]]; then
+        CMD_LINE="${CMD_LINE} cryptdevice=UUID=${CRYPT_UUID}:cryptroot root=/dev/mapper/cryptroot"
+    fi
+
+    # Lógica VM vs Bare Metal para el GRUB
+    if [[ "$IS_VM" != "none" ]]; then
+        CMD_LINE="${CMD_LINE} nomodeset" # Sin 'quiet' y forzando TTY visible
+    else
+        CMD_LINE="${CMD_LINE} quiet amdgpu.ppfeaturemask=0xffffffff"
+    fi
+
     sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${CMD_LINE}\"|" /etc/default/grub
 
     pacman -S --noconfirm sbctl grub-btrfs
@@ -415,7 +396,6 @@ task_10() {
 }
 
 task_11() {
-    # Mantenimiento y Sello Final
     printf '[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd\n' > /etc/systemd/zram-generator.conf
     systemctl enable ufw.service fstrim.timer
     sudo -u "$USERNAME" yay -Sc --noconfirm || true
@@ -450,12 +430,11 @@ rm -f /mnt/iceman_chroot.sh /mnt/iceman.conf 2>/dev/null || true
 umount -R /mnt 2>/dev/null || true
 
 echo -e "\n${C_PURPLE}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_PURPLE}║  TITANIUM HYPRLAND EDITION (v9.0)        ║${C_DEF}"
+echo -e "${C_PURPLE}║  TITANIUM HYPRLAND EDITION (v9.1)        ║${C_DEF}"
 echo -e "${C_PURPLE}╠══════════════════════════════════════════╣${C_DEF}"
 printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Entorno"      "$([ "$IS_VM" != "none" ] && echo 'Virtual Machine' || echo 'Bare Metal AMD')"
+printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Seguridad"    "$([ "$USE_LUKS" == "YES" ] && echo 'LUKS2 + Btrfs' || echo 'Btrfs Directo')"
 printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Compositor"   "Hyprland (CachyOS Git)"
-printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Shell"        "AGS (Caelestia Engine)"
-printf "${C_PURPLE}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Display"      "SDDM Dark + Wayland"
 echo -e "${C_PURPLE}╚══════════════════════════════════════════╝${C_DEF}"
 
 echo -e "\n${C_GREEN}¡Instalación completada! Escribe 'reboot' para entrar al nuevo mundo.${C_DEF}"
