@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS ARCHITECT - TITANIUM GNOME EDITION (GOLD 3.0 - DYNAMIC CORE)
+# ICEMAN OS ARCHITECT - TITANIUM GNOME EDITION (GOLD 3.1 - TTY FIX)
 # Hardware: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT
-# Contenido: Monolítico, Curl-Safe, CachyOS Nativo, Theming Blindado
+# Contenido: Monolítico, Curl-Safe, CachyOS Nativo, Fix Bucle TTY
 # ==============================================================================
 
 # Encapsulamiento de seguridad para ejecución via curl
@@ -26,7 +26,7 @@ INSTALL_START=$SECONDS
 
 clear
 echo -e "${C_CYAN}======================================================${C_DEF}"
-echo -e "${C_GREEN}   ICEMAN OS ARCHITECT - TITANIUM GNOME (GOLD 3.0)    ${C_DEF}"
+echo -e "${C_GREEN}   ICEMAN OS ARCHITECT - TITANIUM GNOME (GOLD 3.1)    ${C_DEF}"
 echo -e "${C_CYAN}======================================================${C_DEF}\n"
 
 echo -e "${C_YELLOW}[!] Inicializando matriz GNOME nativa, por favor espere...${C_DEF}\n"
@@ -50,28 +50,29 @@ if ! grep -q "cachyos" /etc/pacman.conf 2>/dev/null; then
     echo -e "\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n" >> /etc/pacman.conf
 fi
 
-# ── Configuración Interactiva ──────────────────────────────────────────────────
+# ── Configuración Interactiva (Redirigido a /dev/tty para evitar bucles) ──────
 echo -e "${C_CYAN}--- PERFIL Y TOPOLOGÍA DE ALMACENAMIENTO ---${C_DEF}\n"
 
 echo -e "  1) Full Gaming  (Steam, ProtonPlus, Flatpak Bottles, Mandos, OBS...)"
 echo -e "  2) Desktop Limpio  (Solo GNOME y herramientas de productividad)"
-read -p "➤ Perfil de instalación [1-2] (Por defecto: 1): " PROFILE_SEL
+read -p "➤ Perfil de instalación [1-2] (Por defecto: 1): " PROFILE_SEL < /dev/tty
 INSTALL_PROFILE=${PROFILE_SEL:-1}
 
 echo -e "\n${C_CYAN}Discos disponibles:${C_DEF}"
 lsblk -d -n -p -o NAME,SIZE,MODEL | grep -v "loop" | awk '{print NR ") " $0}'
 echo ""
-read -p "➤ Selecciona el número del disco de destino: " D_SEL; D_SEL=${D_SEL:-1}
+read -p "➤ Selecciona el número del disco de destino: " D_SEL < /dev/tty
+D_SEL=${D_SEL:-1}
 TARGET_DISK=$(lsblk -d -n -p -o NAME | grep -v "loop" | sed -n "${D_SEL}p")
 
 if [[ -z "$TARGET_DISK" ]]; then echo -e "${C_RED}[!] Disco inválido.${C_DEF}"; exit 1; fi
 
-read -p "➤ ¿Cifrar disco completo con LUKS2? [s/N] (Por defecto: N): " LUKS_ANS
+read -p "➤ ¿Cifrar disco completo con LUKS2? [s/N] (Por defecto: N): " LUKS_ANS < /dev/tty
 if [[ ${LUKS_ANS,,} =~ ^(s|y)$ ]]; then
     USE_LUKS="YES"
     while true; do
-        read -s -p "  Contraseña LUKS: " LUKS_PASS1; echo ""
-        read -s -p "  Confirma LUKS:   " LUKS_PASS2; echo ""
+        read -s -p "  Contraseña LUKS: " LUKS_PASS1 < /dev/tty; echo ""
+        read -s -p "  Confirma LUKS:   " LUKS_PASS2 < /dev/tty; echo ""
         [[ "$LUKS_PASS1" == "$LUKS_PASS2" && -n "$LUKS_PASS1" ]] && break || echo -e "${C_RED}[!] Las contraseñas no coinciden. Repite.${C_DEF}"
     done
 else
@@ -79,15 +80,15 @@ else
     LUKS_PASS1=""
 fi
 
-read -p "➤ Nombre de usuario administrador [Por defecto: iceman]: " USERNAME
+read -p "➤ Nombre de usuario administrador [Por defecto: iceman]: " USERNAME < /dev/tty
 USERNAME=${USERNAME:-iceman}
 while true; do
-    read -s -p "➤ Contraseña para $USERNAME (y root): " USER_PASS1; echo ""
-    read -s -p "➤ Confirma la contraseña:              " USER_PASS2; echo ""
+    read -s -p "➤ Contraseña para $USERNAME (y root): " USER_PASS1 < /dev/tty; echo ""
+    read -s -p "➤ Confirma la contraseña:              " USER_PASS2 < /dev/tty; echo ""
     [[ "$USER_PASS1" == "$USER_PASS2" && -n "$USER_PASS1" ]] && break || echo -e "${C_RED}[!] Las contraseñas no coinciden. Repite.${C_DEF}"
 done
 
-read -p "➤ Nombre del equipo [Por defecto: iceman-pc]: " HOSTNAME_PC
+read -p "➤ Nombre del equipo [Por defecto: iceman-pc]: " HOSTNAME_PC < /dev/tty
 HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
 
 # Detección de resolución dinámica
@@ -99,7 +100,7 @@ case "$RAW_RES" in
 esac
 
 echo -e "\n${C_RED}[!] ADVERTENCIA: Se destruirán TODOS los datos en ${TARGET_DISK}${C_DEF}"
-read -p "➤ Escribe 'CONFIRMAR' para continuar (o aborta): " CONFIRM_INPUT
+read -p "➤ Escribe 'CONFIRMAR' para continuar (o aborta): " CONFIRM_INPUT < /dev/tty
 [[ "$CONFIRM_INPUT" != "CONFIRMAR" ]] && { echo -e "${C_YELLOW}Instalación abortada por el usuario.${C_DEF}"; exit 0; }
 
 # ── Motor de Spinners y Tareas ────────────────────────────────────────────────
@@ -280,7 +281,6 @@ task_2() {
     sed -i 's/^#Color/Color/' /etc/pacman.conf
     grep -qx 'ILoveCandy' /etc/pacman.conf || sed -i '/^Color/a ILoveCandy' /etc/pacman.conf
 
-    # Aseguramos que CachyOS esté presente en la config del nuevo sistema
     if ! grep -q "cachyos" /etc/pacman.conf; then
         echo -e "\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n" >> /etc/pacman.conf
         pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist
@@ -362,7 +362,6 @@ task_8() {
     mkdir -p /usr/share/backgrounds/iceman /usr/share/gnome-background-properties
     cp /tmp/iceman-repo/wallpapers/*.webp /usr/share/backgrounds/iceman/ 2>/dev/null || true
 
-    # Forzar existencia de default.webp para asegurar que se aplique el esquema
     FIRST_WP=$(ls -1 /usr/share/backgrounds/iceman/*.webp 2>/dev/null | head -n 1)
     if [[ -n "$FIRST_WP" ]]; then
         ln -sf "$FIRST_WP" /usr/share/backgrounds/iceman/default.webp
@@ -431,7 +430,6 @@ task_10() {
     chmod 750 /.snapshots
     systemctl enable snapper-timeline.timer snapper-cleanup.timer grub-btrfsd.service || true
 
-    # Instalación de GRUB directa para compatibilidad chroot
     git clone --quiet https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle
     mkdir -p /usr/share/grub/themes/Particle-circle-window
     cp -r /tmp/particle/Particle-circle-window/* /usr/share/grub/themes/Particle-circle-window/ 2>/dev/null || true
@@ -511,7 +509,7 @@ umount -R /mnt 2>/dev/null || true
 
 ELAPSED=$(( SECONDS - INSTALL_START ))
 echo -e "\n${C_GREEN}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_GREEN}║  TITANIUM GNOME EDITION (GOLD 3.0)       ║${C_DEF}"
+echo -e "${C_GREEN}║  TITANIUM GNOME EDITION (GOLD 3.1)       ║${C_DEF}"
 echo -e "${C_GREEN}╠══════════════════════════════════════════╣${C_DEF}"
 printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Hostname"     "$HOSTNAME_PC"
 printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Usuario"      "$USERNAME"
