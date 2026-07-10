@@ -1,9 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# ICEMAN OS ARCHITECT - TITANIUM GNOME EDITION (GOLD 2.0 - REFUSED EDITION)
+# ICEMAN OS ARCHITECT - TITANIUM GNOME EDITION (GOLD 3.0 - DYNAMIC CORE)
 # Hardware: AMD Ryzen 9 5950X | AMD Radeon RX 7600 XT
-# Contenido: 100% IDÉNTICO AL ORIGINAL (Arrays, GSchema, P10k, LUKS) + Spinners
+# Contenido: Monolítico, Curl-Safe, CachyOS Nativo, Theming Blindado
 # ==============================================================================
+
+# Encapsulamiento de seguridad para ejecución via curl
+{
 set +e 
 
 # ── Colores ────────────────────────────────────────────────────────────────────
@@ -23,7 +26,7 @@ INSTALL_START=$SECONDS
 
 clear
 echo -e "${C_CYAN}======================================================${C_DEF}"
-echo -e "${C_GREEN}   ICEMAN OS ARCHITECT - TITANIUM GNOME (GOLD 2.0)    ${C_DEF}"
+echo -e "${C_GREEN}   ICEMAN OS ARCHITECT - TITANIUM GNOME (GOLD 3.0)    ${C_DEF}"
 echo -e "${C_CYAN}======================================================${C_DEF}\n"
 
 echo -e "${C_YELLOW}[!] Inicializando matriz GNOME nativa, por favor espere...${C_DEF}\n"
@@ -36,12 +39,16 @@ if ! ping -c 1 archlinux.org >/dev/null 2>&1; then
     echo -e "${C_RED}[✗] Sin conexión a Internet. Abortando.${C_DEF}"; exit 1
 fi
 
-# Purgar repositorios rotos del entorno Live para evitar el error 404
-if grep -q "cachyos" /etc/pacman.conf 2>/dev/null; then
-    sed -i '/\[cachyos\]/,+2d' /etc/pacman.conf 2>/dev/null || true
-    sed -i '/cachyos-mirrorlist/d' /etc/pacman.conf 2>/dev/null || true
-fi
 timedatectl set-ntp true
+
+# Inyección temprana de CachyOS en el LiveUSB (Evita doble instalación de kernel)
+if ! grep -q "cachyos" /etc/pacman.conf 2>/dev/null; then
+    echo -e "${C_CYAN}[+] Preparando entorno Live para CachyOS...${C_DEF}"
+    pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keyserver.ubuntu.com >/dev/null 2>&1
+    pacman-key --lsign-key F3B607488DB35A47 >/dev/null 2>&1
+    pacman -U 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst' 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-18-1-any.pkg.tar.zst' --noconfirm >/dev/null 2>&1
+    echo -e "\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n" >> /etc/pacman.conf
+fi
 
 # ── Configuración Interactiva ──────────────────────────────────────────────────
 echo -e "${C_CYAN}--- PERFIL Y TOPOLOGÍA DE ALMACENAMIENTO ---${C_DEF}\n"
@@ -83,7 +90,7 @@ done
 read -p "➤ Nombre del equipo [Por defecto: iceman-pc]: " HOSTNAME_PC
 HOSTNAME_PC=${HOSTNAME_PC:-iceman-pc}
 
-# Detección de resolución (Gold 2.0)
+# Detección de resolución dinámica
 RAW_RES=$(cat /sys/class/drm/*/modes 2>/dev/null | grep -v '^i' | sort -t'x' -k2 -n | tail -1 || echo "1920x1080")
 case "$RAW_RES" in
     3840x2160*) GRUB_SCREEN="4k"; GRUB_GFXMODE="3840x2160x32" ;;
@@ -144,7 +151,7 @@ run_task() {
 
 echo -e "\n${C_CYAN}--- INICIANDO INSTALACIÓN DEL SISTEMA ---${C_DEF}"
 
-# ── Cirugía de Disco y BTRFS (Exacto a Gold 2.0) ──────────────────────────────
+# ── Cirugía de Disco y BTRFS ──────────────────────────────────────────────────
 disk_setup() {
     umount -A -R /mnt 2>/dev/null || true
     cryptsetup close cryptroot 2>/dev/null || true
@@ -188,14 +195,14 @@ disk_setup() {
 }
 run_task "Purgando Sectores y Particionando GPT" "disk_setup"
 
-# ── Pacstrap Base (Sin romper ISO) ────────────────────────────────────────────
+# ── Pacstrap Base (Instalación Nativa CachyOS) ────────────────────────────────
 pacstrap_base() {
     mkdir -p /mnt/etc
     echo 'KEYMAP=es' > /mnt/etc/vconsole.conf
     echo 'LANG=es_ES.UTF-8' > /mnt/etc/locale.conf
 
-    # Instalamos 'linux' oficial aquí. CachyOS se inyectará en la Tarea 2 del chroot.
-    BASE_PKGS="base base-devel linux linux-headers linux-firmware sof-firmware amd-ucode btrfs-progs btrfsmaintenance nano vim git networkmanager grub efibootmgr os-prober plymouth ufw apparmor pacman-contrib sudo zram-generator cups avahi nss-mdns sane wget curl p7zip unzip ntfs-3g exfatprogs sbctl"
+    # Instalamos directamente linux-cachyos gracias a la inyección previa
+    BASE_PKGS="base base-devel linux-cachyos linux-cachyos-headers linux-firmware sof-firmware amd-ucode btrfs-progs btrfsmaintenance nano vim git networkmanager grub efibootmgr os-prober plymouth ufw apparmor pacman-contrib sudo zram-generator cups avahi nss-mdns sane wget curl p7zip unzip ntfs-3g exfatprogs sbctl"
     [[ "$USE_LUKS" == "YES" ]] && BASE_PKGS+=" cryptsetup"
 
     pacstrap -K /mnt ${BASE_PKGS}
@@ -204,9 +211,9 @@ pacstrap_base() {
     sed -i 's/subvolid=[0-9]*,//g' /mnt/etc/fstab
     [[ "$USE_LUKS" == "YES" ]] && echo "cryptroot UUID=$(blkid -s UUID -o value "$P2") none luks,discard" > /mnt/etc/crypttab || true
 }
-run_task "Inyectando Sistema Base" "pacstrap_base"
+run_task "Inyectando Sistema Base optimizado" "pacstrap_base"
 
-# ── Configuración de Chroot (El Core 100% Gold) ───────────────────────────────
+# ── Configuración de Chroot (Core Titanium) ───────────────────────────────────
 cat > /mnt/iceman.conf << CONFIG
 USERNAME="${USERNAME}"
 USER_PASS1="${USER_PASS1}"
@@ -264,7 +271,7 @@ POLKIT2
 }
 
 task_2() {
-    # Pacman Candy, Reflector y CachyOS Swap
+    # Pacman Candy, Reflector y consolidación CachyOS
     pacman-key --init && pacman-key --populate archlinux
     reflector --country Spain,France,Germany --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || true
 
@@ -273,17 +280,11 @@ task_2() {
     sed -i 's/^#Color/Color/' /etc/pacman.conf
     grep -qx 'ILoveCandy' /etc/pacman.conf || sed -i '/^Color/a ILoveCandy' /etc/pacman.conf
 
-    # Inyección CachyOS Dinámica y Segura (Desde el chroot)
-    pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keyserver.ubuntu.com
-    pacman-key --lsign-key F3B607488DB35A47
-    echo -e "\n[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/cachyos\n" >> /etc/pacman.conf
-    pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist
-    sed -i '/\[cachyos\]/,+2d' /etc/pacman.conf
-    sed -i '/^\[core\]/i [cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' /etc/pacman.conf
-    
-    # Cambiamos kernel linux por linux-cachyos
-    pacman -Syyu --noconfirm linux-cachyos linux-cachyos-headers
-    pacman -Rns --noconfirm linux linux-headers || true
+    # Aseguramos que CachyOS esté presente en la config del nuevo sistema
+    if ! grep -q "cachyos" /etc/pacman.conf; then
+        echo -e "\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n" >> /etc/pacman.conf
+        pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist
+    fi
 }
 
 task_3() {
@@ -351,7 +352,7 @@ task_7() {
 }
 
 task_8() {
-    # Estética GNOME, Extensiones y GSchema Override
+    # Estética GNOME, Wallpapers Default y GSchema Blindado
     install_pacman papirus-icon-theme yaru-icon-theme
     AUR_EST=(adw-gtk3 papirus-folders-git breezex-cursor-theme gnome-shell-extension-dash-to-dock gnome-shell-extension-blur-my-shell gnome-shell-extension-vitals gnome-shell-extension-appindicator gnome-shell-extension-caffeine gnome-shell-extension-clipboard-indicator gnome-shell-extension-gsconnect gnome-shell-extension-just-perfection gnome-shell-extension-gamemode gnome-shell-extension-sound-output-device-chooser gnome-shell-extension-tilingshell gnome-shell-extension-noannoyance)
     install_aur "${AUR_EST[@]}"
@@ -360,6 +361,12 @@ task_8() {
     git clone --quiet https://github.com/Ic3MaN77/iceman-installer.git /tmp/iceman-repo
     mkdir -p /usr/share/backgrounds/iceman /usr/share/gnome-background-properties
     cp /tmp/iceman-repo/wallpapers/*.webp /usr/share/backgrounds/iceman/ 2>/dev/null || true
+
+    # Forzar existencia de default.webp para asegurar que se aplique el esquema
+    FIRST_WP=$(ls -1 /usr/share/backgrounds/iceman/*.webp 2>/dev/null | head -n 1)
+    if [[ -n "$FIRST_WP" ]]; then
+        ln -sf "$FIRST_WP" /usr/share/backgrounds/iceman/default.webp
+    fi
 
     {
         echo '<?xml version="1.0" encoding="UTF-8"?><wallpapers>'
@@ -381,6 +388,9 @@ cursor-theme='BreezeX-Dark'
 [org.gnome.desktop.background]
 picture-uri='file:///usr/share/backgrounds/iceman/default.webp'
 picture-uri-dark='file:///usr/share/backgrounds/iceman/default.webp'
+
+[org.gnome.desktop.screensaver]
+picture-uri='file:///usr/share/backgrounds/iceman/default.webp'
 SCHEMA
     glib-compile-schemas /usr/share/glib-2.0/schemas/
 }
@@ -403,7 +413,7 @@ ZSHRC
 }
 
 task_10() {
-    # mkinitcpio, GRUB PARTICLE-CIRCLE y SECURE BOOT
+    # mkinitcpio, GRUB PARTICLE-CIRCLE Manual y SECURE BOOT
     sed -i 's/^MODULES=()/MODULES=(btrfs amdgpu)/' /etc/mkinitcpio.conf
     if [[ "$USE_LUKS" == "YES" ]]; then
         sed -i 's/^HOOKS=(.*/HOOKS=(base udev plymouth autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck btrfs)/' /etc/mkinitcpio.conf
@@ -421,10 +431,10 @@ task_10() {
     chmod 750 /.snapshots
     systemctl enable snapper-timeline.timer snapper-cleanup.timer grub-btrfsd.service || true
 
+    # Instalación de GRUB directa para compatibilidad chroot
     git clone --quiet https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle
-    cd /tmp/particle || true
-    chmod +x install.sh
-    ./install.sh -t window -s "${GRUB_SCREEN}" || true
+    mkdir -p /usr/share/grub/themes/Particle-circle-window
+    cp -r /tmp/particle/Particle-circle-window/* /usr/share/grub/themes/Particle-circle-window/ 2>/dev/null || true
     
     echo "LANG=es_ES.UTF-8" >> /etc/default/grub
     if grep -q '^GRUB_THEME=' /etc/default/grub; then
@@ -501,7 +511,7 @@ umount -R /mnt 2>/dev/null || true
 
 ELAPSED=$(( SECONDS - INSTALL_START ))
 echo -e "\n${C_GREEN}╔══════════════════════════════════════════╗${C_DEF}"
-echo -e "${C_GREEN}║  TITANIUM GNOME EDITION (GOLD 2.0)       ║${C_DEF}"
+echo -e "${C_GREEN}║  TITANIUM GNOME EDITION (GOLD 3.0)       ║${C_DEF}"
 echo -e "${C_GREEN}╠══════════════════════════════════════════╣${C_DEF}"
 printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Hostname"     "$HOSTNAME_PC"
 printf "${C_GREEN}║${C_DEF}  %-14s: ${C_YELLOW}%s${C_DEF}\n" "Usuario"      "$USERNAME"
@@ -517,3 +527,6 @@ echo -e "  ${C_CYAN}2.${C_DEF} Ve a Secure Boot y elige ${C_YELLOW}'Erase Keys'$
 echo -e "  ${C_CYAN}3.${C_DEF} Inicia tu nuevo Iceman OS, abre terminal y escribe:"
 echo -e "     ${C_GREEN}sudo sbctl enroll-keys -m${C_DEF}"
 echo -e "\n¡Listo! Escribe ${C_YELLOW}reboot${C_DEF} para arrancar."
+
+# Cierre del encapsulamiento de seguridad curl
+}
