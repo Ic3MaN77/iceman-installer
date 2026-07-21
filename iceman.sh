@@ -62,7 +62,7 @@ msg_ok "Conexión a internet establecida."
 
 echo -e "\n${C_YELLOW}Discos disponibles en el sistema:${C_NC}" >&3
 lsblk -d -p -n -l -o NAME,SIZE,MODEL | grep -v loop >&3
-echo -n -e "\n${C_CYAN}Introduce la ruta del disco a formatear (ej. /dev/nvme0n1): ${C_NC}" >&3
+echo -n -e "\n${C_CYAN}Introduce la ruta del disco a formatear (ej. /dev/sda o /dev/nvme0n1): ${C_NC}" >&3
 read -r DISK
 if [ ! -b "$DISK" ]; then
     echo -e "${C_RED}ERROR: Disco no válido o no encontrado.${C_NC}" >&3
@@ -103,21 +103,19 @@ fi
 msg "Sincronizando relojes del sistema (NTP)..."
 timedatectl set-ntp true >> "$LOG_FILE" 2>&1
 
-msg "Inyectando repositorios oficiales de CachyOS en el entorno Live..."
-pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com >> "$LOG_FILE" 2>&1
-pacman-key --lsign-key F3B607488DB35A47 >> "$LOG_FILE" 2>&1
-pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist cachyos-v3-mirrorlist >> "$LOG_FILE" 2>&1
-
-cat <<EOT>> /etc/pacman.conf
-[cachyos-v3]
-Include = /etc/pacman.d/cachyos-v3-mirrorlist
-[cachyos]
-Include = /etc/pacman.d/cachyos-mirrorlist
-EOT
-
-msg "Optimizando pacman.conf (Descargas paralelas e ILoveCandy)..."
+msg "Optimizando pacman.conf del entorno Live..."
 sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 grep -q "ILoveCandy" /etc/pacman.conf || sed -i '/#VerbosePkgLists/a ILoveCandy' /etc/pacman.conf
+
+msg "Inyectando repositorios oficiales de CachyOS (Auto-detección de CPU)..."
+cd /tmp
+curl -sO https://mirror.cachyos.org/cachyos-repo.tar.xz >> "$LOG_FILE" 2>&1
+tar xf cachyos-repo.tar.xz >> "$LOG_FILE" 2>&1
+cd cachyos-repo
+./cachyos-repo.sh >> "$LOG_FILE" 2>&1
+cd /
+
+msg_ok "Repositorios CachyOS añadidos correctamente."
 
 # ==============================================================================
 # FASE 3: PARTICIONADO Y BTRFS
@@ -131,7 +129,8 @@ sgdisk -Z "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 1:0:+1G -t 1:ef00 -c 1:"EFI" "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK" >> "$LOG_FILE" 2>&1
 
-if [[ "$DISK" == *"nvme"* ]]; then
+# Detección dinámica de nomenclatura de particiones (SATA vs NVMe vs VBox)
+if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"loop"* ]]; then
     PART_EFI="${DISK}p1"
     PART_ROOT="${DISK}p2"
 else
@@ -181,6 +180,9 @@ pacstrap -K /mnt base base-devel linux-cachyos linux-cachyos-headers linux-firmw
 msg "Generando FSTAB..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
+msg "Clonando pacman.conf del LiveCD al nuevo sistema..."
+cp /etc/pacman.conf /mnt/etc/pacman.conf
+
 msg "Iniciando configuración interna (Chroot)..."
 arch-chroot /mnt /bin/bash <<EOF
 set -e
@@ -194,12 +196,7 @@ echo "LANG=${LOCALE}" > /etc/locale.conf
 echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 echo "${HOSTNAME_DEF}" > /etc/hostname
 
-# 2. Configuración de Pacman en el sistema destino
-sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
-grep -q "ILoveCandy" /etc/pacman.conf || sed -i '/#VerbosePkgLists/a ILoveCandy' /etc/pacman.conf
-sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
-sed -i "/\[core\]/i \[cachyos-v3\]\nInclude = \/etc\/pacman.d\/cachyos-v3-mirrorlist\n\n\[cachyos\]\nInclude = \/etc\/pacman.d\/cachyos-mirrorlist\n" /etc/pacman.conf
-
+# 2. Refrescar llaves de pacman en el entorno chroot
 pacman-key --init
 pacman-key --populate archlinux cachyos
 pacman -Sy
@@ -211,52 +208,61 @@ echo "${USER_NAME}:${PASSWORD}" | chpasswd
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
 
 # 4. Optimizaciones Makepkg para Ryzen 5950X
-sed -i 's/^CFLAGS=.*/CFLAGS="-march=znver3 -mtune=znver3 -O2 -pipe -fno-plt -fexceptions \\"/g' /etc/makepkg.conf
-sed -i 's/^MAKEFLAGS=.*/MAKEFLAGS="-j16"/g' /etc/makepkg.conf
+sed -i 's/^CFLAGS=.*/CFLAGS="-march=znver3 -mtune=znver3 -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"/' /etc/makepkg.conf
+sed -i 's/^CXXFLAGS=.*/CXXFLAGS="\$CFLAGS"/' /etc/makepkg.conf
+sed -i 's/^MAKEFLAGS=.*/MAKEFLAGS="-j16"/' /etc/makepkg.conf
 
-# 5. Drivers AMD (RX 7600 XT) y Multimedia
+# 5. Configurar ZRAM Automático
+cat <<ZRAM > /etc/systemd/zram-generator.conf
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+swap-priority = 100
+fs-type = swap
+ZRAM
+
+# 6. Drivers AMD (RX 7600 XT) y Multimedia
 pacman -S --noconfirm mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver mesa-vdpau gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav corectrl
 
-# 6. Entorno Gráfico (GNOME), Red y Seguridad
+# 7. Entorno Gráfico (GNOME), Red y Seguridad
 pacman -S --noconfirm gnome gnome-tweaks gdm xdg-desktop-portal-gnome ufw gufw
 systemctl enable NetworkManager
 systemctl enable gdm
 systemctl enable fstrim.timer
 systemctl enable ufw
 
-# 7. Plymouth y MKINITCPIO
+# 8. Plymouth y MKINITCPIO
 sed -i 's/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth filesystems fsck)/g' /etc/mkinitcpio.conf
 pacman -S --noconfirm plymouth-theme-arch-logo
 plymouth-set-default-theme -R arch-logo
 mkinitcpio -P
 
-# 8. GRUB y Tema Dinámico
+# 9. GRUB y Tema Dinámico
 mkdir -p /boot/grub/themes
 git clone https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle-grub
 cp -r /tmp/particle-grub/Particle-circle /boot/grub/themes/
 
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
 sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 rd.udev.log_priority=3 vt.global_cursor_default=0 amdgpu.ppfeaturemask=0xffffffff"/' /etc/default/grub
-sed -i 's/^#GRUB_THEME=.*/GRUB_THEME="\/boot\/grub\/themes\/Particle-circle\/theme.txt"/' /etc/default/grub
+sed -i 's|^#GRUB_THEME=.*|GRUB_THEME="/boot/grub/themes/Particle-circle/theme.txt"|' /etc/default/grub
 sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 echo 'GRUB_GFXMODE="2560x1440,auto"' >> /etc/default/grub
 
 if [ ${LUKS_OPT} -eq 1 ]; then
-    # \$(...) se ejecuta dentro del chroot gracias al escape
     UUID=\$(blkid -s UUID -o value ${PART_ROOT})
-    sed -i "s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=\$UUID:cryptroot root=\/dev\/mapper\/cryptroot\"/" /etc/default/grub
+    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=\$UUID:cryptroot root=/dev/mapper/cryptroot\"|" /etc/default/grub
 fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# 9. Software Base, Gaming y Mantenimiento
+# 10. Software Base, Gaming y Mantenimiento
 pacman -S --noconfirm firefox thunderbird qbittorrent steam lutris mangohud gamemode flatpak snapper btrfs-assistant grub-btrfs waypaper swww sudo base-devel
 
-# 10. Compilar e Instalar YAY (como usuario sin privilegios)
+# 11. Compilar e Instalar YAY (como usuario sin privilegios)
 su - ${USER_NAME} -c "cd /tmp && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm"
 
-# 11. Instalar dependencias AUR y Extras (Pamac, OnlyOffice, etc)
+# 12. Instalar dependencias AUR y Extras
 su - ${USER_NAME} -c "yay -S --noconfirm onlyoffice-bin pamac-aur heroic-games-launcher-bin protonup-qt"
 EOF
 msg_ok "Configuración Chroot finalizada con éxito."
