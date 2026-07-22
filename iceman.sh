@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ARCH LINUX + CACHYOS INSTALLER (EDICIÓN ICEMAN V3 - ZERO BUGS)
+# ARCH LINUX + CACHYOS INSTALLER (EDICIÓN ICEMAN V4 - BULLETPROOF)
 # Hardware Target: Universal (Metal Ryzen 5950X / VM de Pruebas)
 # ==============================================================================
 
@@ -30,7 +30,7 @@ manejar_error() {
     echo -e "${C_RED}\n[!] FALLO CRÍTICO EN LA LÍNEA ${linea}.${C_NC}" >&3
     echo -e "${C_YELLOW}--- ÚLTIMAS 15 LÍNEAS DEL LOG ---${C_NC}" >&3
     tail -n 15 "$LOG_FILE" >&3
-    echo -e "${C_RED}\nInstalación abortada. Revisa el log en $LOG_FILE${C_NC}" >&3
+    echo -e "${C_RED}\nInstalación abortada. Revisa el log completo en $LOG_FILE${C_NC}" >&3
     exit 1
 }
 
@@ -40,7 +40,7 @@ msg_warn() { echo -e "${C_YELLOW} [WARN] ${1}${C_NC}" >&3; echo "[WARN] ${1}" >>
 
 clear >&3
 echo -e "${C_BLUE}=================================================${C_NC}" >&3
-echo -e "${C_BLUE}    INSTALADOR ARCH LINUX + CACHYOS (ICEMAN V3)  ${C_NC}" >&3
+echo -e "${C_BLUE}    INSTALADOR ARCH LINUX + CACHYOS (ICEMAN V4)  ${C_NC}" >&3
 echo -e "${C_BLUE}=================================================${C_NC}" >&3
 echo "Iniciando log en $LOG_FILE" > "$LOG_FILE"
 
@@ -99,7 +99,7 @@ if [[ "$LUKS_ANS" =~ ^[Ss]$ ]]; then
 fi
 
 # ==============================================================================
-# FASE 2: ENTORNO LIVE E INYECCIÓN DE CACHYOS (NON-INTERACTIVE)
+# FASE 2: ENTORNO LIVE E INYECCIÓN DE CACHYOS (MÉTODO TARBALL LOCAL)
 # ==============================================================================
 msg "Sincronizando relojes del sistema (NTP)..."
 timedatectl set-ntp true >> "$LOG_FILE" 2>&1
@@ -107,33 +107,32 @@ timedatectl set-ntp true >> "$LOG_FILE" 2>&1
 msg "Optimizando pacman.conf del entorno Live..."
 sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
 
-msg "Inyectando repositorios oficiales de CachyOS..."
+msg "Saneando pacman.conf de ejecuciones anteriores..."
+sed -i '/\[cachyos.*/,$d' /etc/pacman.conf
 
-# 1. Backupear pacman.conf e inyectar repo temporal con el nombre EXACTO [cachyos]
-cp /etc/pacman.conf /etc/pacman.conf.bak
-cat <<EOT >> /etc/pacman.conf
+msg "Inyectando repositorios de CachyOS vía Tarball Oficial..."
+rm -rf /tmp/cachyos-repo*
+curl -sSL "https://mirror.cachyos.org/cachyos-repo.tar.xz" -o /tmp/cachyos-repo.tar.xz >> "$LOG_FILE" 2>&1
+mkdir -p /tmp/cachyos-repo
+tar -xf /tmp/cachyos-repo.tar.xz -C /tmp/cachyos-repo --strip-components=1 2>/dev/null || tar -xf /tmp/cachyos-repo.tar.xz -C /tmp/cachyos-repo >> "$LOG_FILE" 2>&1
 
-[cachyos]
-SigLevel = TrustAll
-Server = https://mirror.cachyos.org/repo/\$arch/\$repo
-EOT
+# Instalación offline directa de los paquetes .pkg.tar.zst descargados
+pacman -U --noconfirm /tmp/cachyos-repo/*.pkg.tar.zst >> "$LOG_FILE" 2>&1
 
-# 2. Descargar e instalar las llaves de CachyOS (Ya no dará error 404)
-pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist cachyos-v3-mirrorlist >> "$LOG_FILE" 2>&1
+msg "Inicializando y firmando llaves de CachyOS..."
+pacman-key --init >> "$LOG_FILE" 2>&1
+pacman-key --populate archlinux cachyos >> "$LOG_FILE" 2>&1
 
-# 3. Restaurar pacman.conf limpio
-mv /etc/pacman.conf.bak /etc/pacman.conf
-
-# 4. Detectar CPU (v3 para Metal Ryzen, estándar para VM)
+# Detectar soporte x86_64_v3 (Ryzen 5950X = Sí, VMs estándar = No)
 if /lib/ld-linux-x86-64.so.2 --help | grep -q "x86-64-v3 (supported, searched)"; then
     msg_ok "Arquitectura x86_64_v3 detectada. Habilitando repos optimizados."
     V3_SUPPORT=1
 else
-    msg_warn "Arquitectura v3 NO detectada (Común en VMs). Usando repos estándar."
+    msg_warn "Arquitectura v3 NO detectada (VM). Usando repos estándar."
     V3_SUPPORT=0
 fi
 
-# 5. Insertar repositorios estructurados correctamente sobre [core]
+msg "Estructurando repositorios en /etc/pacman.conf..."
 awk -v v3="$V3_SUPPORT" '
 /^\[core\]/ && !inserted {
     if (v3 == 1) {
@@ -144,14 +143,11 @@ awk -v v3="$V3_SUPPORT" '
     print "[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n"
     inserted=1
 }
-{print}' /etc/pacman.conf > /tmp/pacman.conf
-mv /tmp/pacman.conf /etc/pacman.conf
+{print}' /etc/pacman.conf > /tmp/pacman.conf.new
+mv /tmp/pacman.conf.new /etc/pacman.conf
 
-# 6. Inicializar y confiar en las llaves nativas
-pacman-key --init >> "$LOG_FILE" 2>&1
-pacman-key --populate archlinux cachyos >> "$LOG_FILE" 2>&1
 pacman -Sy >> "$LOG_FILE" 2>&1
-msg_ok "Repositorios CachyOS configurados con éxito."
+msg_ok "Repositorios CachyOS sincronizados correctamente."
 
 # ==============================================================================
 # FASE 3: PARTICIONADO, LUKS (PBKDF2) Y BTRFS
@@ -165,7 +161,6 @@ sgdisk -Z "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 1:0:+1G -t 1:ef00 -c 1:"EFI" "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK" >> "$LOG_FILE" 2>&1
 
-# Asignación correcta de particiones (SDA vs NVME/LOOP)
 if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"loop"* ]]; then
     PART_EFI="${DISK}p1"
     PART_ROOT="${DISK}p2"
@@ -182,8 +177,10 @@ if [ $LUKS_OPT -eq 1 ]; then
     echo -n "$LUKS_PASS" | cryptsetup -q luksFormat --type luks2 --pbkdf pbkdf2 "$PART_ROOT" - >> "$LOG_FILE" 2>&1
     echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptroot - >> "$LOG_FILE" 2>&1
     MAPPER_ROOT="/dev/mapper/cryptroot"
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
 else
     MAPPER_ROOT="$PART_ROOT"
+    ROOT_UUID=""
 fi
 
 msg "Formateando BTRFS y creando subvolúmenes..."
@@ -216,7 +213,7 @@ pacstrap -K /mnt base base-devel linux-cachyos linux-cachyos-headers linux-firmw
 msg "Generando FSTAB..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
-msg "Clonando pacman.conf inyectado al nuevo sistema..."
+msg "Clonando pacman.conf al nuevo sistema..."
 cp /etc/pacman.conf /mnt/etc/pacman.conf
 
 msg "Iniciando configuración interna (Chroot)..."
@@ -235,7 +232,7 @@ echo "${HOSTNAME_DEF}" > /etc/hostname
 # 2. Habilitar Multilib
 sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
 
-# 3. Inicializar llaves en chroot de forma segura
+# 3. Inicializar llaves en chroot
 pacman-key --init
 pacman-key --populate archlinux cachyos
 pacman -Sy
@@ -246,7 +243,7 @@ useradd -m -G wheel -s /bin/bash ${USER_NAME}
 echo "${USER_NAME}:${PASSWORD}" | chpasswd
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
 
-# 5. Optimizaciones de Compilación
+# 5. Optimizaciones de Compilación (Dinámicas para el host actual)
 sed -i 's/^CFLAGS=.*/CFLAGS="-march=native -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"/' /etc/makepkg.conf
 sed -i 's/^CXXFLAGS=.*/CXXFLAGS="\$CFLAGS"/' /etc/makepkg.conf
 sed -i 's/^MAKEFLAGS=.*/MAKEFLAGS="-j\$(nproc)"/' /etc/makepkg.conf
@@ -263,16 +260,16 @@ ZRAM
 # 7. Drivers y Multimedia
 pacman -S --noconfirm mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver mesa-vdpau gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav corectrl
 
-# 8. Entorno Gráfico y Servicios Base
+# 8. Entorno Gráfico GNOME y Red
 pacman -S --noconfirm gnome gnome-tweaks gdm xdg-desktop-portal-gnome ufw gufw
 systemctl enable NetworkManager
 systemctl enable gdm
 systemctl enable fstrim.timer
 systemctl enable ufw
 
-# 9. MKINITCPIO Dinámico (LUKS + Plymouth BGRT)
+# 9. Configuración MKINITCPIO (LUKS + Plymouth BGRT)
 if [ ${LUKS_OPT} -eq 1 ]; then
-    HOOKS_LINE="HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt plymouth btrfs filesystems fsck)"
+    HOOKS_LINE="HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth encrypt btrfs filesystems fsck)"
 else
     HOOKS_LINE="HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth btrfs filesystems fsck)"
 fi
@@ -280,26 +277,25 @@ sed -i "s/^HOOKS=(.*/\$HOOKS_LINE/" /etc/mkinitcpio.conf
 plymouth-set-default-theme bgrt
 mkinitcpio -P
 
-# 10. GRUB Dinámico (Soporte Cryptodisk)
+# 10. Configuración GRUB
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
 sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 rd.udev.log_priority=3 vt.global_cursor_default=0 amdgpu.ppfeaturemask=0xffffffff"/' /etc/default/grub
 sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 echo 'GRUB_GFXMODE="2560x1440,auto"' >> /etc/default/grub
 
 if [ ${LUKS_OPT} -eq 1 ]; then
-    UUID=\$(blkid -s UUID -o value ${PART_ROOT})
-    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=\$UUID:cryptroot root=/dev/mapper/cryptroot\"|" /etc/default/grub
-    echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub
+    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot\"|" /etc/default/grub
+    grep -q "GRUB_ENABLE_CRYPTODISK=y" /etc/default/grub || echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub
 fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# 11. Software de Usuario Base y Gaming (Incluyendo YAY nativo de CachyOS)
+# 11. Software de Usuario Base y Gaming
 pacman -S --noconfirm yay firefox thunderbird qbittorrent steam lutris mangohud gamemode flatpak snapper btrfs-assistant grub-btrfs waypaper swww
 
-# 12. Instalar Extras vía YAY (Como usuario normal)
-su - ${USER_NAME} -c "yay -S --noconfirm onlyoffice-bin pamac-aur heroic-games-launcher-bin protonup-qt"
+# 12. Instalar Extras vía YAY (Protegido contra fallos menores de AUR)
+su - ${USER_NAME} -c "yay -S --noconfirm onlyoffice-bin pamac-aur heroic-games-launcher-bin protonup-qt" || true
 
 EOF
 msg_ok "Configuración Chroot finalizada con éxito."
