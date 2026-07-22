@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# ARCH LINUX + CACHYOS INSTALLER (EDICIÓN ICEMAN)
-# Hardware Target: Ryzen 9 5950X, AMD RX 7600 XT, B550 Aorus (o VM de Pruebas)
+# ARCH LINUX + CACHYOS INSTALLER (EDICIÓN ICEMAN V2)
+# Hardware Target: Universal (Metal Ryzen 5950X / VM de Pruebas)
 # ==============================================================================
 
 set -eo pipefail
@@ -22,7 +22,7 @@ LOCALE="es_ES.UTF-8"
 KEYMAP="es"
 
 # --- Sistema de Control de Errores ---
-exec 3>&1 4>&2 # Guardar stdout y stderr originales
+exec 3>&1 4>&2
 trap 'manejar_error $LINENO' ERR
 
 manejar_error() {
@@ -30,7 +30,7 @@ manejar_error() {
     echo -e "${C_RED}\n[!] FALLO CRÍTICO EN LA LÍNEA ${linea}.${C_NC}" >&3
     echo -e "${C_YELLOW}--- ÚLTIMAS 15 LÍNEAS DEL LOG ---${C_NC}" >&3
     tail -n 15 "$LOG_FILE" >&3
-    echo -e "${C_RED}\nInstalación abortada. Revisa el log completo en $LOG_FILE${C_NC}" >&3
+    echo -e "${C_RED}\nInstalación abortada. Revisa el log en $LOG_FILE${C_NC}" >&3
     exit 1
 }
 
@@ -99,62 +99,61 @@ if [[ "$LUKS_ANS" =~ ^[Ss]$ ]]; then
 fi
 
 # ==============================================================================
-# FASE 2: PREPARACIÓN DEL ENTORNO LIVE E INYECCIÓN DE CACHYOS (SIN INTERACCIÓN)
+# FASE 2: ENTORNO LIVE E INYECCIÓN DE CACHYOS (NON-INTERACTIVE)
 # ==============================================================================
 msg "Sincronizando relojes del sistema (NTP)..."
 timedatectl set-ntp true >> "$LOG_FILE" 2>&1
 
 msg "Optimizando pacman.conf del entorno Live..."
 sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
-grep -q "ILoveCandy" /etc/pacman.conf || sed -i '/#VerbosePkgLists/a ILoveCandy' /etc/pacman.conf
 
-msg "Inyectando repositorios oficiales de CachyOS (Método Bootstrap Automático)..."
+msg "Inyectando repositorios oficiales de CachyOS..."
 
-# 1. Inyectar temporalmente el repositorio al final sin verificación GPG
+# 1. Repositorio temporal en modo TrustAll para descargar llaves sin interacción
 cat <<EOT >> /etc/pacman.conf
 
-[cachyos-bootstrap]
-SigLevel = Never
+[cachyos-temp]
+SigLevel = TrustAll
 Server = https://mirror.cachyos.org/repo/x86_64/cachyos
 EOT
 
-# 2. Descargar las llaves (Esto ya no fallará por culpa de firmas externas)
+# 2. Descargar e instalar las llaves de CachyOS
 pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist cachyos-v3-mirrorlist >> "$LOG_FILE" 2>&1
 
-# 3. Eliminar el repositorio temporal de bootstrap limpiamente
-sed -i '/\[cachyos-bootstrap\]/,$d' /etc/pacman.conf
+# 3. Eliminar el repositorio temporal
+sed -i '/\[cachyos-temp\]/,+3d' /etc/pacman.conf
 
-# 4. Detectar dinámicamente si la CPU (VM o Metal) soporta x86_64_v3
+# 4. Detectar CPU (v3 para Metal Ryzen, estándar para VM)
 if /lib/ld-linux-x86-64.so.2 --help | grep -q "x86-64-v3 (supported, searched)"; then
-    msg_ok "Arquitectura de CPU x86_64_v3 detectada. Habilitando repositorios optimizados."
+    msg_ok "Arquitectura x86_64_v3 detectada. Habilitando repos optimizados."
     V3_SUPPORT=1
 else
-    msg_warn "Arquitectura v3 NO detectada (Común en VMs). Habilitando repositorios estándar."
+    msg_warn "Arquitectura v3 NO detectada (Común en VMs). Usando repos estándar."
     V3_SUPPORT=0
 fi
 
-# 5. Insertar los repositorios correctos justo por encima del repo [core] de Arch
+# 5. Insertar repositorios estructurados correctamente sobre [core]
 awk -v v3="$V3_SUPPORT" '
 /^\[core\]/ && !inserted {
     if (v3 == 1) {
         print "[cachyos-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n"
-        print "[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n"
-    } else {
-        print "[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n"
+        print "[cachyos-core-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n"
+        print "[cachyos-extra-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n"
     }
+    print "[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n"
     inserted=1
 }
 {print}' /etc/pacman.conf > /tmp/pacman.conf
 mv /tmp/pacman.conf /etc/pacman.conf
 
-# 6. Inicializar y confiar en las nuevas llaves nativamente
+# 6. Inicializar y confiar en las llaves (pacman-key)
 pacman-key --init >> "$LOG_FILE" 2>&1
 pacman-key --populate archlinux cachyos >> "$LOG_FILE" 2>&1
 pacman -Sy >> "$LOG_FILE" 2>&1
-msg_ok "Repositorios CachyOS añadidos y verificados."
+msg_ok "Repositorios CachyOS configurados con éxito."
 
 # ==============================================================================
-# FASE 3: PARTICIONADO Y BTRFS
+# FASE 3: PARTICIONADO, LUKS (PBKDF2) Y BTRFS
 # ==============================================================================
 msg "Desmontando particiones existentes en $DISK..."
 umount -A --recursive /mnt 2>/dev/null || true
@@ -165,7 +164,6 @@ sgdisk -Z "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 1:0:+1G -t 1:ef00 -c 1:"EFI" "$DISK" >> "$LOG_FILE" 2>&1
 sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK" >> "$LOG_FILE" 2>&1
 
-# Detección dinámica de nomenclatura (sda1 vs nvme0n1p1)
 if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"loop"* ]]; then
     PART_EFI="${DISK}p1"
     PART_ROOT="${DISK}p2"
@@ -174,19 +172,20 @@ else
     PART_ROOT="${DISK}2"
 fi
 
-msg "Formateando partición EFI en FAT32..."
+msg "Formateando partición EFI..."
 mkfs.fat -F32 "$PART_EFI" >> "$LOG_FILE" 2>&1
 
 if [ $LUKS_OPT -eq 1 ]; then
-    msg "Configurando cifrado LUKS en $PART_ROOT..."
-    echo -n "$LUKS_PASS" | cryptsetup -q luksFormat "$PART_ROOT" - >> "$LOG_FILE" 2>&1
+    msg "Configurando cifrado LUKS (PBKDF2 para compatibilidad GRUB)..."
+    # PBKDF2 es vital. GRUB no soporta Argon2id correctamente.
+    echo -n "$LUKS_PASS" | cryptsetup -q luksFormat --type luks2 --pbkdf pbkdf2 "$PART_ROOT" - >> "$LOG_FILE" 2>&1
     echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptroot - >> "$LOG_FILE" 2>&1
     MAPPER_ROOT="/dev/mapper/cryptroot"
 else
     MAPPER_ROOT="$PART_ROOT"
 fi
 
-msg "Formateando BTRFS y creando subvolúmenes oficiales..."
+msg "Formateando BTRFS y creando subvolúmenes..."
 mkfs.btrfs -f -L "ArchCachy" "$MAPPER_ROOT" >> "$LOG_FILE" 2>&1
 mount "$MAPPER_ROOT" /mnt
 
@@ -197,7 +196,7 @@ btrfs subvolume create /mnt/@pkg >> "$LOG_FILE" 2>&1
 btrfs subvolume create /mnt/@snapshots >> "$LOG_FILE" 2>&1
 umount /mnt
 
-msg "Montando estructura de directorios BTRFS..."
+msg "Montando estructura de directorios..."
 MOUNT_OPTS="noatime,compress=zstd:1,space_cache=v2,discard=async"
 mount -o "$MOUNT_OPTS",subvol=@ "$MAPPER_ROOT" /mnt
 mkdir -p /mnt/{home,var/log,var/cache/pacman/pkg,.snapshots,boot/efi}
@@ -210,13 +209,14 @@ mount "$PART_EFI" /mnt/boot/efi
 # ==============================================================================
 # FASE 4: INSTALACIÓN BASE Y CHROOT
 # ==============================================================================
-msg "Instalando sistema base, Kernel CachyOS y Firmware..."
-pacstrap -K /mnt base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode btrfs-progs grub efibootmgr networkmanager nano git curl wget zram-generator sbctl plymouth >> "$LOG_FILE" 2>&1
+msg "Instalando sistema base y Kernel CachyOS..."
+# Incluimos intel-ucode y amd-ucode para máxima portabilidad (Metal <-> VM)
+pacstrap -K /mnt base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode intel-ucode btrfs-progs grub efibootmgr networkmanager nano git curl wget zram-generator sbctl plymouth >> "$LOG_FILE" 2>&1
 
 msg "Generando FSTAB..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
-msg "Clonando pacman.conf optimizado al nuevo sistema..."
+msg "Clonando pacman.conf al nuevo sistema..."
 cp /etc/pacman.conf /mnt/etc/pacman.conf
 
 msg "Iniciando configuración interna (Chroot)..."
@@ -235,7 +235,7 @@ echo "${HOSTNAME_DEF}" > /etc/hostname
 # 2. Habilitar Multilib
 sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
 
-# 3. Inicializar llaves en el nuevo sistema
+# 3. Inicializar llaves en chroot
 pacman-key --init
 pacman-key --populate archlinux cachyos
 pacman -Sy
@@ -246,12 +246,12 @@ useradd -m -G wheel -s /bin/bash ${USER_NAME}
 echo "${USER_NAME}:${PASSWORD}" | chpasswd
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
 
-# 5. Optimizaciones de Compilación (Pensadas para tu Ryzen Final)
-sed -i 's/^CFLAGS=.*/CFLAGS="-march=znver3 -mtune=znver3 -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"/' /etc/makepkg.conf
+# 5. Optimizaciones de Compilación (Dinámico: VM o Metal)
+sed -i 's/^CFLAGS=.*/CFLAGS="-march=native -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"/' /etc/makepkg.conf
 sed -i 's/^CXXFLAGS=.*/CXXFLAGS="\$CFLAGS"/' /etc/makepkg.conf
-sed -i 's/^MAKEFLAGS=.*/MAKEFLAGS="-j16"/' /etc/makepkg.conf
+sed -i 's/^MAKEFLAGS=.*/MAKEFLAGS="-j\$(nproc)"/' /etc/makepkg.conf
 
-# 6. Configurar ZRAM Automático
+# 6. Configurar ZRAM
 cat <<ZRAM > /etc/systemd/zram-generator.conf
 [zram0]
 zram-size = ram / 2
@@ -270,26 +270,27 @@ systemctl enable gdm
 systemctl enable fstrim.timer
 systemctl enable ufw
 
-# 9. Plymouth y MKINITCPIO
-sed -i 's/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth filesystems fsck)/g' /etc/mkinitcpio.conf
-pacman -S --noconfirm plymouth-theme-arch-logo
-plymouth-set-default-theme -R arch-logo
+# 9. MKINITCPIO Dinámico (Soporte seguro para LUKS)
+# Reconstruimos la línea de HOOKS dependiendo de si hay LUKS o no
+if [ ${LUKS_OPT} -eq 1 ]; then
+    HOOKS_LINE="HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt plymouth btrfs filesystems fsck)"
+else
+    HOOKS_LINE="HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth btrfs filesystems fsck)"
+fi
+sed -i "s/^HOOKS=(.*/\$HOOKS_LINE/" /etc/mkinitcpio.conf
+plymouth-set-default-theme -R bgrt
 mkinitcpio -P
 
-# 10. GRUB Dinámico
-mkdir -p /boot/grub/themes
-git clone https://github.com/yeyushengfan258/Particle-circle-grub-theme.git /tmp/particle-grub
-cp -r /tmp/particle-grub/Particle-circle /boot/grub/themes/
-
+# 10. GRUB Dinámico (Con soporte Cryptodisk)
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
 sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 rd.udev.log_priority=3 vt.global_cursor_default=0 amdgpu.ppfeaturemask=0xffffffff"/' /etc/default/grub
-sed -i 's|^#GRUB_THEME=.*|GRUB_THEME="/boot/grub/themes/Particle-circle/theme.txt"|' /etc/default/grub
 sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 echo 'GRUB_GFXMODE="2560x1440,auto"' >> /etc/default/grub
 
 if [ ${LUKS_OPT} -eq 1 ]; then
     UUID=\$(blkid -s UUID -o value ${PART_ROOT})
     sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=\$UUID:cryptroot root=/dev/mapper/cryptroot\"|" /etc/default/grub
+    echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub
 fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy
@@ -301,7 +302,7 @@ pacman -S --noconfirm firefox thunderbird qbittorrent steam lutris mangohud game
 # 12. Compilar e Instalar YAY
 su - ${USER_NAME} -c "cd /tmp && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm"
 
-# 13. Instalar Extras vía YAY (Pamac, OnlyOffice, etc)
+# 13. Instalar Extras vía YAY
 su - ${USER_NAME} -c "yay -S --noconfirm onlyoffice-bin pamac-aur heroic-games-launcher-bin protonup-qt"
 EOF
 msg_ok "Configuración Chroot finalizada con éxito."
