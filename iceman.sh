@@ -1,7 +1,8 @@
 #!/bin/bash
 # ==============================================================================
 # ICEMAN INSTALLER — Arch Linux + Kernel CachyOS (Modo 100% Desatendido)
-# Target: AMD Ryzen 9 5950X / Radeon RX 7600 XT — Gaming / Uso diario
+# Target: AMD Ryzen 9 / Radeon RX — Gaming / Uso diario
+# Optimización: Uso intensivo de RAM (tmpfs) para acelerar compilación y despliegue
 # Idioma: es_ES.UTF-8 · Zona horaria: Europe/Madrid
 # ==============================================================================
 
@@ -13,9 +14,6 @@ IFS=$'\n\t'
 # ------------------------------------------------------------------------------
 LOG_FILE="/var/log/iceman_install.log"
 : > "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/iceman_install.log"; : > "$LOG_FILE"
-
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
 
 C_BLUE="\033[1;34m"; C_CYAN="\033[1;36m"; C_GREEN="\033[1;32m"
 C_RED="\033[1;31m";  C_YELLOW="\033[1;33m"; C_MAGENTA="\033[1;35m"; C_NC="\033[0m"
@@ -86,25 +84,55 @@ trap cleanup_on_exit EXIT
 
 clear
 echo -e "${C_BLUE}================================================================${C_NC}"
-echo -e "${C_BLUE}   ICEMAN INSTALLER — ARCH LINUX + CACHYOS (AUTOMÁTICO)        ${C_NC}"
+echo -e "${C_BLUE}       ICEMAN INSTALLER — ARCH LINUX + CACHYOS KERNEL           ${C_NC}"
 echo -e "${C_BLUE}================================================================${C_NC}"
+echo "Log de depuración: $LOG_FILE"
 
 # ------------------------------------------------------------------------------
-# FASE 0: RECOLECCIÓN ÚNICA DE DATOS (Interrupción CERO a partir de aquí)
+# FASE 0: COMPROBACIONES PREVIAS DE SEGURIDAD Y HARDWARE
 # ------------------------------------------------------------------------------
-[ "$EUID" -eq 0 ] || die "Este script debe ejecutarse como root."
-[ -d /sys/firmware/efi/efivars ] || die "Requiere entorno UEFI."
-ping -c 2 -W 3 archlinux.org >/dev/null 2>&1 || die "Sin conexión a Internet."
+step "Comprobaciones previas del sistema (Pre-vuelo)"
+[ "$EUID" -eq 0 ] || die "Este script debe ejecutarse con privilegios de root."
 
-echo -e "\n${C_YELLOW}Discos detectados:${C_NC}"
+if [ -d /sys/firmware/efi/efivars ]; then
+    msg_ok "Arranque en modo UEFI verificado."
+else
+    die "Este script requiere estrictamente un arranque en modo UEFI."
+fi
+
+for cmd in curl pacstrap sgdisk mkfs.btrfs cryptsetup; do
+    command -v "$cmd" >/dev/null || die "Falta la dependencia crítica: $cmd"
+done
+msg_ok "Herramientas de particionado e instalación disponibles."
+
+if ping -c 2 -W 3 archlinux.org >/dev/null 2>&1; then
+    msg_ok "Conexión a Internet establecida."
+else
+    die "Sin conexión a Internet. Verifica tu red."
+fi
+
+FREE_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+if [ "$FREE_RAM_MB" -lt 16000 ]; then
+    msg_warn "Se recomiendan 32GB de RAM para este perfil. Detectado: ${FREE_RAM_MB}MB."
+    msg_info "El montaje en RAM (tmpfs) podría causar problemas de memoria."
+else
+    msg_ok "Memoria RAM óptima detectada (${FREE_RAM_MB}MB). Aceleración tmpfs permitida."
+fi
+
+# ------------------------------------------------------------------------------
+# FASE 1: RECOLECCIÓN ÚNICA DE DATOS (Punto de no retorno)
+# ------------------------------------------------------------------------------
+step "Configuración de instalación (Única intervención del usuario)"
+
+echo -e "\n${C_YELLOW}Discos de almacenamiento detectados:${C_NC}"
 lsblk -d -p -n -o NAME,SIZE,MODEL,TRAN | grep -v -E 'loop|sr0'
 echo ""
-read -rp "$(echo -e ${C_CYAN}'Introduce la ruta del disco a formatear (ej. /dev/nvme0n1): '${C_NC})" DISK < /dev/tty
-[ -b "$DISK" ] || die "El dispositivo ‘$DISK’ no existe."
+read -rp "$(echo -e ${C_CYAN}'Ruta exacta del disco a usar (ej. /dev/nvme0n1): '${C_NC})" DISK < /dev/tty
+[ -b "$DISK" ] || die "El dispositivo ‘$DISK’ no es válido o no existe."
 
-echo -e "${C_RED}\n¡ADVERTENCIA! Se BORRARÁ POR COMPLETO el disco: ${DISK}${C_NC}"
-read -rp "$(echo -e ${C_RED}'Escribe BORRAR para confirmar: '${C_NC})" CONFIRM < /dev/tty
-[ "$CONFIRM" = "BORRAR" ] || die "Confirmación no válida. Instalación abortada."
+echo -e "${C_RED}\n¡ADVERTENCIA CRÍTICA! Vas a BORRAR POR COMPLETO el disco ${DISK}${C_NC}"
+read -rp "$(echo -e ${C_RED}'Escribe "BORRAR" en mayúsculas para confirmar: '${C_NC})" CONFIRM < /dev/tty
+[ "$CONFIRM" = "BORRAR" ] || die "Confirmación de seguridad no superada. Abortado."
 
 read -rp "Nombre de usuario [Iceman]: " USER_NAME < /dev/tty; USER_NAME="${USER_NAME:-Iceman}"
 read -rp "Nombre del equipo [Arch-Gaming-Rig]: " HOSTNAME_DEF < /dev/tty; HOSTNAME_DEF="${HOSTNAME_DEF:-Arch-Gaming-Rig}"
@@ -113,29 +141,29 @@ while true; do
     read -rsp "Contraseña para ${USER_NAME} y root: " PASSWORD < /dev/tty; echo
     read -rsp "Repite la contraseña: " PASSWORD2 < /dev/tty; echo
     [ -n "$PASSWORD" ] && [ "$PASSWORD" = "$PASSWORD2" ] && break
-    msg_warn "Las contraseñas no coinciden o están vacías."
+    msg_warn "Las contraseñas no coinciden o están vacías. Inténtalo de nuevo."
 done
 
 LUKS_OPT=0
-read -rp "¿Cifrar partición raíz con LUKS2? (s/N): " LUKS_ANS < /dev/tty
+read -rp "¿Deseas cifrar la partición raíz con LUKS2? (s/N): " LUKS_ANS < /dev/tty
 if [[ "$LUKS_ANS" =~ ^[Ss]$ ]]; then
     LUKS_OPT=1
     while true; do
         read -rsp "Contraseña de cifrado LUKS: " LUKS_PASS < /dev/tty; echo
         read -rsp "Repite contraseña LUKS: " LUKS_PASS2 < /dev/tty; echo
         [ -n "$LUKS_PASS" ] && [ "$LUKS_PASS" = "$LUKS_PASS2" ] && break
-        msg_warn "Contraseñas LUKS no coinciden."
+        msg_warn "Las contraseñas LUKS no coinciden."
     done
 fi
 
-echo -e "\n${C_GREEN}✔ Datos recolectados con éxito. Iniciando modo 100% autónomo...${C_NC}\n"
-sleep 2
+echo -e "\n${C_GREEN}✔ Todos los datos recopilados. Tomando el control total del proceso...${C_NC}\n"
+sleep 3
 
 # ------------------------------------------------------------------------------
-# FASE 1: DETECCIÓN Y SINCRONIZACIÓN AUTOMÁTICA
+# FASE 2: PREPARACIÓN DEL ENTORNO AUTOMATIZADO
 # ------------------------------------------------------------------------------
-step "Preparando el entorno y sincronización de reloj"
-run_spin "Sincronizando reloj (NTP)" timedatectl set-ntp true
+step "Detección de hardware y optimización de red"
+run_spin "Sincronizando reloj del sistema (NTP)" timedatectl set-ntp true
 
 VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || echo none)"
 [ "$VIRT_TYPE" = "none" ] && IS_VM=0 || IS_VM=1
@@ -161,31 +189,31 @@ ROTA=$(cat "/sys/block/${DISK_BASE}/queue/rotational" 2>/dev/null || echo 1)
 [ "$ROTA" = "0" ] && IS_SSD=1 || IS_SSD=0
 
 # ------------------------------------------------------------------------------
-# FASE 2: INYECCIÓN DESATENDIDA DE CACHYOS
+# FASE 3: INYECCIÓN DESATENDIDA DE REPOSITORIOS
 # ------------------------------------------------------------------------------
-step "Inyectando repositorios CachyOS (Modo Autónomo)"
+step "Inyectando repositorios y llaves (Arch + CachyOS)"
 sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
 sed -i '/^#\[multilib\]/,/^#Include/{s/^#//}' /etc/pacman.conf
-run_spin "Sincronizando Pacman base" pacman -Sy --noconfirm
+run_spin "Sincronizando base de Pacman" pacman -Sy --noconfirm
 
 cd "$WORK_DIR"
-run_spin "Descargando CachyOS Repo" curl -sSL "https://mirror.cachyos.org/cachyos-repo.tar.xz" -o cachyos-repo.tar.xz
+run_spin "Descargando instalador de repositorios CachyOS" curl -sSL "https://mirror.cachyos.org/cachyos-repo.tar.xz" -o cachyos-repo.tar.xz
 mkdir -p cachyos-repo
 tar -xf cachyos-repo.tar.xz -C cachyos-repo --strip-components=1
 cd cachyos-repo
 chmod +x cachyos-repo.sh
-run_spin "Ejecutando cachyos-repo.sh de forma autónoma" bash -c "yes | ./cachyos-repo.sh --install"
+run_spin "Instalando repositorios CachyOS" bash -c "yes | ./cachyos-repo.sh --install"
 cd "$WORK_DIR"
-run_spin "Sincronizando repositorios CachyOS" pacman -Syy --noconfirm
+run_spin "Actualizando repositorios combinados" pacman -Syy --noconfirm
 
 # ------------------------------------------------------------------------------
-# FASE 3: PARTICIONADO Y MONTAJE BTRFS
+# FASE 4: PARTICIONADO Y ESTRUCTURA DE DISCO
 # ------------------------------------------------------------------------------
-step "Preparando almacenamiento en $DISK"
+step "Formateo estructural de $DISK"
 umount -R /mnt 2>/dev/null || true
 cryptsetup close cryptroot 2>/dev/null || true
 
-run_spin "Borrando y re-particionando GPT" bash -c "sgdisk -Z \"$DISK\" && sgdisk -n 1:0:+1G -t 1:ef00 -c 1:\"EFI\" \"$DISK\" && sgdisk -n 2:0:0 -t 2:8300 -c 2:\"ROOT\" \"$DISK\""
+run_spin "Generando tabla de particiones GPT" bash -c "sgdisk -Z \"$DISK\" && sgdisk -n 1:0:+1G -t 1:ef00 -c 1:\"EFI\" \"$DISK\" && sgdisk -n 2:0:0 -t 2:8300 -c 2:\"ROOT\" \"$DISK\""
 partprobe "$DISK" >> "$LOG_FILE" 2>&1 || true
 sleep 2
 
@@ -195,11 +223,11 @@ else
     PART_EFI="${DISK}1";  PART_ROOT="${DISK}2"
 fi
 
-run_spin "Formateando partición EFI" mkfs.fat -F32 -n EFI "$PART_EFI"
+run_spin "Estructurando partición de arranque (FAT32)" mkfs.fat -F32 -n EFI "$PART_EFI"
 
 if [ "$LUKS_OPT" -eq 1 ]; then
-    run_spin "Configurando cifrado LUKS2" bash -c "printf '%s' \"$LUKS_PASS\" | cryptsetup -q luksFormat --type luks2 --pbkdf pbkdf2 \"$PART_ROOT\" -"
-    run_spin "Abriendo volumen LUKS2" bash -c "printf '%s' \"$LUKS_PASS\" | cryptsetup open \"$PART_ROOT\" cryptroot -"
+    run_spin "Aplicando cifrado LUKS2 en la raíz" bash -c "printf '%s' \"$LUKS_PASS\" | cryptsetup -q luksFormat --type luks2 --pbkdf pbkdf2 \"$PART_ROOT\" -"
+    run_spin "Desbloqueando volumen LUKS2" bash -c "printf '%s' \"$LUKS_PASS\" | cryptsetup open \"$PART_ROOT\" cryptroot -"
     MAPPER_ROOT="/dev/mapper/cryptroot"
     ROOT_UUID="$(blkid -s UUID -o value "$PART_ROOT")"
 else
@@ -207,7 +235,7 @@ else
     ROOT_UUID=""
 fi
 
-run_spin "Formateando BTRFS" mkfs.btrfs -f -L ArchCachy "$MAPPER_ROOT"
+run_spin "Formateando sistema de archivos BTRFS" mkfs.btrfs -f -L ArchCachy "$MAPPER_ROOT"
 mount "$MAPPER_ROOT" /mnt
 for sv in @ @home @log @pkg @snapshots; do btrfs subvolume create "/mnt/${sv}" >/dev/null; done
 umount /mnt
@@ -222,34 +250,34 @@ mount -o "${MOUNT_OPTS},subvol=@snapshots" "$MAPPER_ROOT" /mnt/.snapshots
 mount "$PART_EFI" /mnt/boot/efi
 
 # ------------------------------------------------------------------------------
-# FASE 4: ACELERACIÓN RAM (TMPFS)
+# FASE 5: OPTIMIZACIÓN EXTREMA EN MEMORIA (TMPFS)
 # ------------------------------------------------------------------------------
-step "Montando aceleradores de rendimiento en RAM (tmpfs)"
+step "Configurando aceleradores lógicos en memoria RAM"
 mount -t tmpfs -o size=16G,mode=1777 tmpfs /mnt/tmp
 mount -t tmpfs -o size=8G tmpfs /mnt/var/cache/pacman/pkg
-msg_ok "Caché y área de compilación derivadas a memoria RAM (32GB)."
+msg_ok "Montajes en RAM (tmpfs) activados. SSD protegido de escrituras temporales."
 
 # ------------------------------------------------------------------------------
-# FASE 5: PACSTRAP Y ARCHIVOS DE CONFIGURACIÓN
+# FASE 6: INSTALACIÓN DEL SISTEMA BASE
 # ------------------------------------------------------------------------------
-step "Instalando sistema base con Pacstrap (en memoria RAM)"
+step "Despliegue del sistema operativo base"
 BASE_PKGS=(
     base base-devel linux-cachyos linux-cachyos-headers linux-cachyos-lts linux-cachyos-lts-headers
     linux-firmware ${MICROCODE_PKG} cachyos-keyring cachyos-hooks cachyos-settings
     btrfs-progs grub grub-btrfs efibootmgr os-prober networkmanager nano vim git curl wget rsync
     zram-generator sbctl plymouth ntfs-3g exfatprogs dosfstools
 )
-run_visible "pacstrap" pacstrap -K /mnt "${BASE_PKGS[@]}" --noconfirm
+run_visible "Instalando paquetes mediante pacstrap" pacstrap -K /mnt "${BASE_PKGS[@]}" --noconfirm
 
-run_spin "Generando fstab" genfstab -U /mnt >> /mnt/etc/fstab
-[ "$LUKS_OPT" -eq 0 ] || echo "# cryptdevice UUID=$ROOT_UUID en GRUB" >> /mnt/etc/fstab
+run_spin "Generando tabla de particiones estática (fstab)" genfstab -U /mnt >> /mnt/etc/fstab
+[ "$LUKS_OPT" -eq 0 ] || echo "# Referencia cryptdevice UUID=$ROOT_UUID reservada para GRUB" >> /mnt/etc/fstab
 cp /etc/pacman.conf /mnt/etc/pacman.conf
 bash -c 'cp -a /etc/pacman.d/cachyos*-mirrorlist /mnt/etc/pacman.d/ 2>/dev/null || true'
 
 # ------------------------------------------------------------------------------
-# FASE 6: CONSTRUCCIÓN DEL SCRIPT CHROOT DESATENDIDO
+# FASE 7: CONSTRUCCIÓN DEL CONTROLADOR CHROOT
 # ------------------------------------------------------------------------------
-step "Preparando ejecutable de configuración interna"
+step "Inyectando secuencias lógicas de configuración interna"
 install -d -m 700 /mnt/root
 {
     printf 'USER_NAME=%q\n'    "$USER_NAME"
@@ -311,7 +339,7 @@ run_visible_soft() {
     "$@" 2>&1 | tee -a "$LOG" || true
 }
 
-echo -e "${C_CYAN}==> [chroot] Regionalización y Red${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Regionalización e Identidad de Red${C_NC}"
 ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime && hwclock --systohc
 echo "${LOCALE_NAME} UTF-8" > /etc/locale.gen
 locale-gen >> "$LOG" 2>&1
@@ -319,21 +347,21 @@ echo "LANG=${LOCALE_NAME}" > /etc/locale.conf
 echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 echo "${HOSTNAME_DEF}" > /etc/hostname
 
-echo -e "${C_CYAN}==> [chroot] Pacman Keys${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Llavero y Firmas del Sistema${C_NC}"
 sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 15/' /etc/pacman.conf
-run_spin "Inicializando llaves" pacman-key --init
-run_spin "Poblando firmas Arch y CachyOS" pacman-key --populate archlinux cachyos
-run_spin "Sincronizando bases de datos" pacman -Syy --noconfirm
+run_spin "Iniciando llavero general" pacman-key --init
+run_spin "Importando firmas oficiales (Arch + CachyOS)" pacman-key --populate archlinux cachyos
+run_spin "Sincronizando índices locales" pacman -Syy --noconfirm
 
-echo -e "${C_CYAN}==> [chroot] Cuentas y Accesos${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Estructura de Cuentas y Privilegios${C_NC}"
 echo "root:${PASSWORD}" | chpasswd
-run_spin "Creando usuario ${USER_NAME}" useradd -m -G wheel,input,video,audio,storage,optical -s /bin/bash "${USER_NAME}"
+run_spin "Integrando usuario de sistema (${USER_NAME})" useradd -m -G wheel,input,video,audio,storage,optical -s /bin/bash "${USER_NAME}"
 echo "${USER_NAME}:${PASSWORD}" | chpasswd
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/90-temp-installer
 chmod 440 /etc/sudoers.d/*
 
-echo -e "${C_CYAN}==> [chroot] Optimizando Makepkg en RAM${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Overdrive de Compilación en RAM${C_NC}"
 sed -i 's/^CFLAGS=.*/CFLAGS="-march=native -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"/' /etc/makepkg.conf
 sed -i 's/^CXXFLAGS=.*/CXXFLAGS="\$CFLAGS"/' /etc/makepkg.conf
 sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j\$(nproc)"/' /etc/makepkg.conf
@@ -348,22 +376,22 @@ swap-priority = 100
 fs-type = swap
 EOF
 
-echo -e "${C_CYAN}==> [chroot] Drivers Gráficos, Escritorio y Codecs${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Pila Gráfica, GNOME y Multimedia${C_NC}"
 COMMON_MEDIA=(gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav ffmpeg a52dec faac faad2 x264 x265 xvidcore libdvdcss)
 if [ "$IS_VM" -eq 0 ] && [ "$GPU_VENDOR" = "amd" ]; then
-    run_visible "Drivers AMD + Codecs" pacman -S --noconfirm --needed mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver corectrl "${COMMON_MEDIA[@]}"
+    run_visible "Instalando controladores AMD de alto rendimiento" pacman -S --noconfirm --needed mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver lib32-libva-mesa-driver corectrl "${COMMON_MEDIA[@]}"
 else
-    run_visible "Drivers Genéricos + Codecs" pacman -S --noconfirm --needed mesa lib32-mesa "${COMMON_MEDIA[@]}"
+    run_visible "Instalando pila de video genérica" pacman -S --noconfirm --needed mesa lib32-mesa "${COMMON_MEDIA[@]}"
 fi
 
-run_visible "GNOME + Utilidades" pacman -S --noconfirm --needed gnome gnome-tweaks gdm xdg-desktop-portal-gnome xdg-user-dirs bluez bluez-utils ufw gufw
-run_spin "Habilitando servicios de sistema" bash -c "systemctl enable NetworkManager gdm fstrim.timer bluetooth ufw"
+run_visible "Desplegando GNOME y utilidades core" pacman -S --noconfirm --needed gnome gnome-tweaks gdm xdg-desktop-portal-gnome xdg-user-dirs bluez bluez-utils ufw gufw
+run_spin "Habilitando demonios de servicio" bash -c "systemctl enable NetworkManager gdm fstrim.timer bluetooth ufw"
 
-echo -e "${C_CYAN}==> [chroot] Configuración de Initramfs y Bootloader${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Generación del Núcleo y Gestor de Arranque${C_NC}"
 [ "${LUKS_OPT}" -eq 1 ] && HOOKS="base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth encrypt btrfs filesystems fsck" || HOOKS="base udev autodetect microcode modconf kms keyboard keymap consolefont block plymouth btrfs filesystems fsck"
 sed -i "s|^HOOKS=(.*|HOOKS=(${HOOKS})|" /etc/mkinitcpio.conf
 plymouth-set-default-theme -R bgrt >> "$LOG" 2>&1 || true
-run_visible "Generando initramfs" mkinitcpio -P
+run_visible "Construyendo imágenes Initramfs" mkinitcpio -P
 
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=4/' /etc/default/grub
 sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 rd.udev.log_priority=3 vt.global_cursor_default=0"/' /etc/default/grub
@@ -373,39 +401,39 @@ if [ "${LUKS_OPT}" -eq 1 ]; then
     echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub
 fi
 
-run_spin "Instalando GRUB EFI" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy --recheck
-run_spin "Generando configuración de GRUB" grub-mkconfig -o /boot/grub/grub.cfg
+run_spin "Integrando GRUB en partición EFI" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy --recheck
+run_spin "Compilando archivo de configuración GRUB" grub-mkconfig -o /boot/grub/grub.cfg
 
-echo -e "${C_CYAN}==> [chroot] Snapper (Instantáneas BTRFS)${C_NC}"
-run_visible "Instalando Snapper" pacman -S --noconfirm --needed snapper snap-pac btrfs-assistant
-run_spin "Inicializando Snapper" snapper --no-dbus -c root create-config /
+echo -e "${C_CYAN}==> [chroot] Automatización de Instantáneas (Snapper)${C_NC}"
+run_visible "Instalando paquetes de resiliencia BTRFS" pacman -S --noconfirm --needed snapper snap-pac btrfs-assistant
+run_spin "Inicializando Snapper en la raíz" snapper --no-dbus -c root create-config /
 btrfs subvolume delete /.snapshots >> "$LOG" 2>&1 || true
 mkdir -p /.snapshots
 mount -a >> "$LOG" 2>&1 || true
-run_spin "Habilitando Timers de Snapper" systemctl enable snapper-timeline.timer snapper-cleanup.timer grub-btrfsd
+run_spin "Habilitando temporizadores de instantáneas" systemctl enable snapper-timeline.timer snapper-cleanup.timer grub-btrfsd
 
-echo -e "${C_CYAN}==> [chroot] Firma de Secure Boot${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Certificación Secure Boot${C_NC}"
 if sbctl status 2>/dev/null | grep -qi "Setup Mode:.*Enabled"; then
-    run_spin "Generando claves Secure Boot" sbctl create-keys
-    run_spin "Inscribiendo llaves Microsoft" sbctl enroll-keys --microsoft
+    run_spin "Generando base de datos de claves (sbctl)" sbctl create-keys
+    run_spin "Inscribiendo certificados en NVRAM" sbctl enroll-keys --microsoft
     for f in /boot/vmlinuz-linux-cachyos /boot/vmlinuz-linux-cachyos-lts /boot/efi/EFI/ArchCachy/grubx64.efi /boot/grub/x86_64-efi/core.efi; do
         [ -f "$f" ] && sbctl sign -s "$f" >> "$LOG" 2>&1
     done
 fi
 
-echo -e "${C_CYAN}==> [chroot] Ecosistema Gaming y Flatpak${C_NC}"
-run_visible "Instalando paquetes Gaming" pacman -S --noconfirm --needed firefox thunderbird qbittorrent steam lutris mangohud lib32-mangohud goverlay gamemode lib32-gamemode gamescope wine-staging winetricks flatpak grub-btrfs power-profiles-daemon
+echo -e "${C_CYAN}==> [chroot] Software de Rendimiento y Contenedores${C_NC}"
+run_visible "Adquiriendo ecosistema Gaming" pacman -S --noconfirm --needed firefox thunderbird qbittorrent steam lutris mangohud lib32-mangohud goverlay gamemode lib32-gamemode gamescope wine-staging winetricks flatpak grub-btrfs power-profiles-daemon
 systemctl enable power-profiles-daemon >> "$LOG" 2>&1
-run_spin "Agregando Flathub" flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+run_spin "Vinculando repositorio Flathub" flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
-echo -e "${C_CYAN}==> [chroot] AUR (YAY) en RAM${C_NC}"
-run_visible_soft "Compilando YAY de forma no interactiva" su - "${USER_NAME}" -c '
+echo -e "${C_CYAN}==> [chroot] AUR y Repositorios de Terceros${C_NC}"
+run_visible_soft "Construyendo YAY (Modo no interactivo en RAM)" su - "${USER_NAME}" -c '
     git clone --depth 1 https://aur.archlinux.org/yay-bin.git /tmp/yay-bin
     cd /tmp/yay-bin && makepkg -si --noconfirm
 '
 
 if su - "${USER_NAME}" -c 'command -v yay' >/dev/null 2>&1; then
-    run_visible_soft "Instalando paquetes AUR automatizados" su - "${USER_NAME}" -c '
+    run_visible_soft "Compilando complementos AUR" su - "${USER_NAME}" -c '
         yay -S --noconfirm --needed --answerclean No --answerdiff No --answeredit No \
             pamac-all onlyoffice-desktopeditors heroic-games-launcher-bin protonup-qt game-devices-udev snapd
     '
@@ -413,27 +441,27 @@ fi
 
 if command -v snap >/dev/null 2>&1 || pacman -Qq snapd >/dev/null 2>&1; then
     ln -sf /var/lib/snapd/snap /snap 2>/dev/null || true
-    run_spin "Habilitando sockets de Snapd" bash -c "systemctl enable snapd.socket && systemctl enable snapd.apparmor"
+    run_spin "Preparando entorno Snapd" bash -c "systemctl enable snapd.socket && systemctl enable snapd.apparmor"
 fi
 
-echo -e "${C_CYAN}==> [chroot] Cierre de Seguridad y Limpieza${C_NC}"
+echo -e "${C_CYAN}==> [chroot] Cierre y Sanitización${C_NC}"
 rm -f /etc/sudoers.d/90-temp-installer
-run_spin "Limpiando huérfanos de instalación" bash -c 'orphans=$(pacman -Qtdq); [ -n "$orphans" ] && pacman -Rns --noconfirm $orphans || true'
+run_spin "Purgando paquetes huérfanos" bash -c 'orphans=$(pacman -Qtdq); [ -n "$orphans" ] && pacman -Rns --noconfirm $orphans || true'
 
 exit 0
 CHROOT_EOF
 chmod 700 /mnt/root/iceman_chroot.sh
 
 # ------------------------------------------------------------------------------
-# FASE 7: EJECUCIÓN AUTÓNOMA DEL CHROOT
+# FASE 8: EJECUCIÓN AUTÓNOMA DEL ENTORNO CHROOT
 # ------------------------------------------------------------------------------
-step "Ejecutando configuración completa en el entorno de destino"
+step "Transfiriendo control al nuevo entorno (Chroot)"
 arch-chroot /mnt /root/iceman_chroot.sh || die "Fallo durante la ejecución interna. Revisa /mnt/root/iceman_chroot.log."
 
 # ------------------------------------------------------------------------------
-# FASE 8: DESMONTAJE Y CONCLUSIÓN
+# FASE 9: DESMONTAJE Y LIMPIEZA FINAL
 # ------------------------------------------------------------------------------
-step "Finalizando instalación y limpiando recursos"
+step "Finalizando instalación y liberando recursos"
 rm -f /mnt/root/iceman_vars.sh /mnt/root/iceman_chroot.sh /mnt/root/iceman_chroot.log
 cp "$LOG_FILE" /mnt/var/log/iceman_install.log 2>/dev/null || true
 
@@ -443,8 +471,8 @@ umount -R /mnt
 [ "$LUKS_OPT" -eq 1 ] && cryptsetup close cryptroot
 
 echo -e "\n${C_GREEN}================================================================${C_NC}"
-echo -e "${C_GREEN} ¡INSTALACIÓN AUTÓNOMA FINALIZADA CON ÉXITO!                    ${C_NC}"
+echo -e "${C_GREEN} ¡SISTEMA DESPLEGADO CON ÉXITO!                                 ${C_NC}"
 echo -e "${C_GREEN}================================================================${C_NC}"
-echo -e "  Usuario: ${USER_NAME} | Hostname: ${HOSTNAME_DEF}"
-echo -e "\n  Escribe 'reboot' para iniciar el nuevo sistema.\n"
+echo -e "  Usuario principal: ${USER_NAME} | Equipo: ${HOSTNAME_DEF}"
+echo -e "\n  Escribe 'reboot' para iniciar la máquina desde el disco.\n"
 exit 0
