@@ -1,428 +1,377 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# ICEMAN INSTALLER V3.1 — ENTERPRISE MASTER DEPLOYMENT
+# ICEMAN - Automated Arch Linux / CachyOS Deployment Script
+# VERSIÓN MONOLÍTICA FINAL - BLINDADA, SEGURA Y UNIVERSAL
 # ==============================================================================
 
+# --- ESTÁNDAR MODERNO BASH ---
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# Constantes Globales
-readonly ICEMAN_VERSION="3.1-Enterprise"
-readonly LOG_FILE="/var/log/iceman_install.log"
-readonly JSON_LOG="/var/log/iceman_install.json"
-readonly TIMEZONE="Europe/Madrid"
-readonly LOCALE_NAME="es_ES.UTF-8"
-readonly KEYMAP="es"
-
-# Colores y UI (Centralizados)
-readonly C_BLU="\033[1;34m"
-readonly C_CYA="\033[1;36m"
-readonly C_GRE="\033[1;32m"
-readonly C_RED="\033[1;31m"
-readonly C_YEL="\033[1;33m"
-readonly C_NC="\033[0m"
-
-# Variables de Estado (Estrictamente inicializadas)
-INSTALL_SUCCESS=0
-START_TIME=$SECONDS
-STEP_COUNT=0
-readonly TOTAL_STEPS=12
-declare -A BLOCK_TIMES
-
-HOSTNAME_DEF=""
-USER_NAME=""
-PASSWORD=""
-DESKTOP=""
-DISK=""
-LUKS_OPT=0
-LUKS_PASS=""
-ROOT_UUID=""
-
-CPU_VENDOR="UNKNOWN"
-GPU_VENDOR="UNKNOWN"
-IS_SSD=0
-HAS_BLUETOOTH=0
-VIRT_TYPE="none"
-SECURE_BOOT_STATE="Disabled"
-HAS_INTERNET_AUR=0
-
-# ------------------------------------------------------------------------------
-# 2. FUNCIONES BASE (UI, LOGS, RETRY, MOUNT)
-# ------------------------------------------------------------------------------
-log_info() { echo -e "  ${C_BLU}ℹ INFO:${C_NC} $1"; echo "[$(date '+%H:%M:%S')] [INFO] $*" >> "$LOG_FILE"; }
-log_warn() { echo -e "  ${C_YEL}⚠ WARN:${C_NC} $1"; echo "[$(date '+%H:%M:%S')] [WARN] $*" >> "$LOG_FILE"; }
-log_error() { echo -e "  ${C_RED}✘ ERROR:${C_NC} $1"; echo "[$(date '+%H:%M:%S')] [ERROR] $*" >> "$LOG_FILE"; }
-log_success() { echo -e "  ${C_GRE}✔ OK:${C_NC} $1"; echo "[$(date '+%H:%M:%S')] [SUCCESS] $*" >> "$LOG_FILE"; }
-
-die() { 
-    echo -e "\n${C_RED}[FATAL ERROR] $1${C_NC}\n"
-    log_error "FATAL: $1"
-    exit 1
+# --- 0. FUNCIONES GLOBALES Y TRAP DE LIMPIEZA ---
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo -e "\n[!] SCRIPT FALLÓ CON CÓDIGO $exit_code. INICIANDO LIMPIEZA (TRAP)..."
+        swapoff -a 2>/dev/null || true
+        umount -R /mnt 2>/dev/null || true
+        cryptsetup close "cryptroot" 2>/dev/null || true
+        echo "[i] Limpieza completada. El sistema anfitrión no se ha corrompido."
+    fi
+    exit $exit_code
 }
-
-safe_mount() {
-    mount "$@" || die "Fallo al montar: $*"
-}
-
-draw_progress() {
-    local step=$1 total=$2 title=$3
-    local pc=$(( (step * 100) / total ))
-    local fil=$(( pc / 5 ))
-    local emp=$(( 20 - fil ))
-    local bar=$(printf "%${fil}s" | tr ' ' '█')
-    local e_bar=$(printf "%${emp}s" | tr ' ' '░')
-    
-    echo -e "\n${C_BLU}====================================================${C_NC}"
-    echo -e "${C_BLU}[${step}/${total}]${C_NC} [${C_CYA}${bar}${C_NC}${e_bar}] ${pc}%"
-    echo -e "${C_CYA}➜ ${title}${C_NC}"
-    echo -e "${C_BLU}====================================================${C_NC}"
-    log_info "FASE: ${title}"
-}
+trap cleanup EXIT INT TERM ERR
 
 retry_cmd() {
-    local cmd="$1" max=3 delay=2 n=1
+    local n=1 max=3 delay=2
     while true; do
-        if eval "$cmd" >/dev/null 2>&1; then return 0; else
-            if [[ $n -lt $max ]]; then ((n++)); sleep $delay
-            else return 1; fi
+        if "$@"; then return 0; fi
+        if [[ $n -lt $max ]]; then
+            ((n++))
+            echo "[!] Comando '$1' falló. Reintentando ($n/$max)..."
+            sleep $delay
+        else
+            echo "[!] Error crítico tras $max intentos: $*"
+            return 1
         fi
     done
 }
+export -f retry_cmd
 
-get_password() {
-    local prm=$1 p1="" p2=""
-    while true; do
-        read -rsp "$prm: " p1 < /dev/tty; echo
-        read -rsp "Confirmar $prm: " p2 < /dev/tty; echo
-        if [ "$p1" == "$p2" ] && [ -n "$p1" ]; then echo "$p1"; break
-        else echo -e "${C_YEL}⚠ No coinciden. Reintenta.${C_NC}" >&2; fi
-    done
-}
+# --- 1. COMPROBACIONES ESTRICTAS DE SEGURIDAD Y ENTORNO ---
+echo "[*] Auditando seguridad y entorno anfitrión..."
 
-# ------------------------------------------------------------------------------
-# 3. TRAP GLOBAL (LIMPIEZA SEGURA E IDEMPOTENTE)
-# ------------------------------------------------------------------------------
-cleanup() {
-    local rc=$?
-    if [ "$INSTALL_SUCCESS" -ne 1 ]; then
-        echo -e "\n${C_RED}Abortando. Limpiando entorno...${C_NC}"
-        umount -q /mnt/boot/efi 2>/dev/null || true
-        umount -q /mnt/.snapshots 2>/dev/null || true
-        umount -q /mnt/var/cache/pacman/pkg 2>/dev/null || true
-        umount -q /mnt/var/log 2>/dev/null || true
-        umount -q /mnt/home 2>/dev/null || true
-        umount -q /mnt/tmp 2>/dev/null || true
-        umount -q -R /mnt 2>/dev/null || true
-        [ -e /dev/mapper/cryptroot ] && cryptsetup close cryptroot 2>/dev/null || true
+# C: Verificar Root
+if [ "$EUID" -ne 0 ]; then
+    echo "[!] Error Crítico: Este script debe ejecutarse como root (usa sudo)."
+    exit 1
+fi
+
+# D & B: Verificar binarios críticos del entorno host
+declare -a REQ_TOOLS=("pacstrap" "arch-chroot" "cryptsetup" "sgdisk" "mkfs.btrfs" "mkfs.fat" "btrfs" "blkid" "curl" "tar")
+for tool in "${REQ_TOOLS[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+        echo "[!] Error Crítico: Herramienta necesaria '$tool' no encontrada. ¿Estás en un entorno Arch Live?"
+        exit 1
     fi
-    LUKS_PASS=""; PASSWORD=""
-    rm -f /tmp/iceman* 2>/dev/null || true
-    exit "$rc"
-}
-trap cleanup ERR INT TERM EXIT
+done
 
-# ------------------------------------------------------------------------------
-# 4. FASE 5: INTERACCIÓN CON EL USUARIO
-# ------------------------------------------------------------------------------
-user_input() {
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Datos del Sistema"
-    
-    echo -e "Entorno de escritorio:\n 1) GNOME\n 2) KDE Plasma\n 3) Mínimo (Sin GUI)"
-    while true; do
-        read -rp "Opción (1-3): " opt < /dev/tty
-        case $opt in
-            1) DESKTOP="GNOME"; break ;;
-            2) DESKTOP="KDE"; break ;;
-            3) DESKTOP="NONE"; break ;;
-            *) echo "Inválido." ;;
-        esac
-    done
+# 9: Verificar UEFI
+if [ ! -d "/sys/firmware/efi" ]; then
+    echo "[!] Error Crítico: Este script requiere un sistema arrancado en modo UEFI."
+    echo "    No se detectó /sys/firmware/efi. Abortando."
+    exit 1
+fi
 
-    read -rp "Hostname [Arch-Rig]: " h_in < /dev/tty
-    HOSTNAME_DEF=${h_in:-Arch-Rig}
-    
-    while true; do
-        read -rp "Usuario (minúsculas): " USER_NAME < /dev/tty
-        [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] && break
-        echo "Formato inválido."
-    done
+if ! ping -c 3 archlinux.org &>/dev/null; then
+    echo "[!] Error Crítico: No hay conexión a Internet. Abortando."
+    exit 1
+fi
 
-    PASSWORD=$(get_password "Contraseña Root/User")
+# --- 2. CONFIGURACIÓN INTERACTIVA ---
+echo "========================================================"
+echo " CONFIGURACIÓN DE DESPLIEGUE ICEMAN "
+echo "========================================================"
+read -p "[?] Introduce el disco objetivo (ej: /dev/nvme0n1): " DISK </dev/tty
+if [ ! -b "$DISK" ]; then echo "[!] El dispositivo $DISK no existe."; exit 1; fi
 
-    lsblk -d -p -n -o NAME,SIZE,MODEL,TRAN | grep -v -E 'loop|sr0'
-    while true; do
-        read -rp "Disco (ej. /dev/nvme0n1): " DISK < /dev/tty
-        [ -b "$DISK" ] && break || echo "Disco no encontrado."
-    done
+read -s -p "[?] Introduce la contraseña para LUKS y ROOT: " PASSWORD </dev/tty
+echo
+read -p "[?] Entorno de escritorio (KDE/GNOME/NONE): " DESKTOP_ENV </dev/tty
+DESKTOP_ENV=${DESKTOP_ENV:-KDE}
 
-    read -rp "¿Cifrar con LUKS2? (s/N): " l_ans < /dev/tty
-    if [[ "$l_ans" =~ ^[Ss]$ ]]; then
-        LUKS_OPT=1
-        LUKS_PASS=$(get_password "Contraseña LUKS2")
+CRYPT_NAME="cryptroot"
+HOSTNAME="iceman-pc"
+USERNAME="admin"
+
+declare -a KERNEL_PKG=("linux-cachyos" "linux-cachyos-headers")
+declare -a HW_PKGS=()
+declare -a DE_PKGS=()
+declare -a AUDIO_FONTS=("pipewire" "pipewire-pulse" "pipewire-alsa" "pipewire-jack" "wireplumber" "ttf-dejavu" "ttf-liberation" "noto-fonts")
+
+# --- 3. INYECCIÓN DE CACHYOS (CRÍTICO 1) ---
+echo "[*] Inyectando repositorios y firmas de CachyOS en el entorno Live..."
+curl -sO https://mirror.cachyos.org/cachyos-repo.tar.xz
+tar xf cachyos-repo.tar.xz
+cd cachyos-repo
+./cachyos-repo.sh
+cd ..
+rm -rf cachyos-repo cachyos-repo.tar.xz
+
+echo "[*] Sincronizando bases de datos..."
+retry_cmd pacman -Syy --noconfirm
+
+# E: Reflector
+if command -v reflector &>/dev/null; then
+    echo "[*] Configurando Reflector..."
+    retry_cmd reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || echo "[i] Reflector falló, continuando con espejos actuales."
+else
+    echo "[i] Reflector no instalado. Omitiendo."
+fi
+
+# --- 4. AUDITORÍA DE HARDWARE Y MÁQUINAS VIRTUALES ---
+echo "[*] Auditando hardware..."
+
+if command -v systemd-detect-virt &>/dev/null; then
+    VIRT=$(systemd-detect-virt || true)
+    if [[ "$VIRT" == "kvm" || "$VIRT" == "qemu" ]]; then
+        HW_PKGS+=("qemu-guest-agent")
+        echo "    -> [VM] QEMU/KVM detectado."
+    elif [[ "$VIRT" == "oracle" ]]; then
+        HW_PKGS+=("virtualbox-guest-utils-nox")
+        echo "    -> [VM] VirtualBox detectado."
     fi
-}
+fi
 
-# ------------------------------------------------------------------------------
-# 5. FASE 2: DETECCIÓN AUTOMÁTICA DE HARDWARE
-# ------------------------------------------------------------------------------
-detect_hardware() {
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Auditoría de Hardware"
-    
-    [ -d /sys/firmware/efi/efivars ] || die "Falta UEFI."
-    VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "none")
-    
-    grep -qi "vendor_id.*amd" /proc/cpuinfo && CPU_VENDOR="AMD"
-    grep -qi "vendor_id.*intel" /proc/cpuinfo && CPU_VENDOR="INTEL"
-    
-    if lspci | grep -i vga | grep -qi "nvidia"; then GPU_VENDOR="NVIDIA";
-    elif lspci | grep -i vga | grep -qi "amd\|radeon"; then GPU_VENDOR="AMD";
-    elif lspci | grep -i vga | grep -qi "intel"; then GPU_VENDOR="INTEL"; fi
-    
-    local d_gran=$(cat "/sys/block/$(basename "$DISK")/queue/discard_granularity" 2>/dev/null || echo "0")
-    [ "$d_gran" != "0" ] && IS_SSD=1 || IS_SSD=0
-    
-    lsusb | grep -qi "bluetooth" && HAS_BLUETOOTH=1 || HAS_BLUETOOTH=0
-    
-    curl -I -s --connect-timeout 4 "https://archlinux.org" >/dev/null || die "Sin Internet."
-    curl -I -s --connect-timeout 4 "https://github.com" >/dev/null && HAS_INTERNET_AUR=1 || true
+if grep -q "AuthenticAMD" /proc/cpuinfo; then 
+    HW_PKGS+=("amd-ucode")
+    echo "    -> [CPU] AMD detectada."
+elif grep -q "GenuineIntel" /proc/cpuinfo; then 
+    HW_PKGS+=("intel-ucode")
+    echo "    -> [CPU] Intel detectada."
+fi
 
-    log_success "$CPU_VENDOR | $GPU_VENDOR | SSD:$IS_SSD | VIRT:$VIRT_TYPE"
-}
+if lspci | grep -iE "vga.*nvidia|3d.*nvidia" &> /dev/null; then 
+    HW_PKGS+=("nvidia-dkms" "nvidia-utils")
+    echo "    -> [GPU] NVIDIA detectada."
+fi
 
-# ------------------------------------------------------------------------------
-# 6. FASE 3: PACMAN Y REPOSITORIOS
-# ------------------------------------------------------------------------------
-configure_pacman() {
-    local t0=$SECONDS
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Afinando Pacman"
+# 10: Mejora Regex GPU AMD
+if lspci | grep -iE "vga.*(amd|ati)|3d.*(amd|ati)" &> /dev/null; then 
+    HW_PKGS+=("mesa" "vulkan-radeon" "lib32-vulkan-radeon" "libva-mesa-driver" "mesa-vdpau")
+    echo "    -> [GPU] AMD/ATI detectada."
+fi
 
-    sed -i -e '/^#Color/s/^#//' -e '/^#VerbosePkgLists/s/^#//' \
-           -e '/^#ParallelDownloads/s/^#//' -e '/\[multilib\]/,/Include/s/^#//' /etc/pacman.conf
-    grep -q "^ILoveCandy" /etc/pacman.conf || sed -i '/^Color/a ILoveCandy' /etc/pacman.conf
-    sed -i "s/^#\?\s*ParallelDownloads\s*=.*/ParallelDownloads=10/" /etc/pacman.conf
+DISPLAY_MANAGER=""
+if [[ "${DESKTOP_ENV^^}" == "KDE" ]]; then
+    DE_PKGS=("plasma-meta" "sddm" "konsole" "dolphin" "wayland" "xorg-xwayland")
+    DISPLAY_MANAGER="sddm"
+elif [[ "${DESKTOP_ENV^^}" == "GNOME" ]]; then
+    DE_PKGS=("gnome" "gnome-tweaks" "gdm" "wayland" "xorg-xwayland")
+    DISPLAY_MANAGER="gdm"
+fi
 
-    log_info "Reflector actualizando espejos..."
-    retry_cmd "reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist --protocol https"
+# --- 5. PARTICIONADO Y UDEV ---
+echo "[*] Preparando disco: $DISK"
+wipefs -af "$DISK"
+sgdisk -Z "$DISK"
 
-    pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com >/dev/null 2>&1 || die "Fallo llave Cachy"
-    pacman-key --lsign-key F3B607488DB35A47 >/dev/null 2>&1
-    
-    echo -e "[cachyos]\nServer = https://mirror.cachyos.org/repo/\$arch/\$repo" > /tmp/cachy_tmp.conf
-    cat /tmp/cachy_tmp.conf >> /etc/pacman.conf
-    pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist >/dev/null 2>&1 || die "Fallo Keyring Cachy"
-    
-    sed -i '/\[cachyos\]/,+1d' /etc/pacman.conf
-    echo -e "\n[cachyos]\nSigLevel = Required DatabaseOptional\nInclude = /etc/pacman.d/cachyos-mirrorlist" >> /etc/pacman.conf
-    
-    pacman -Syy >/dev/null 2>&1
-    BLOCK_TIMES["Pacman"]=$((SECONDS - t0))
-}
+sgdisk -n 1:0:+1G -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 2:0:0   -t 2:8300 -c 2:"ROOT" "$DISK"
 
-# ------------------------------------------------------------------------------
-# 7. FASE 4 & 1: PARTICIONADO, LUKS Y BTRFS
-# ------------------------------------------------------------------------------
-prepare_disk() {
-    local t0=$SECONDS
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Discos y Criptografía"
+# F: Sincronización GPT mejorada
+echo "[*] Sincronizando tabla de particiones..."
+partprobe "$DISK" || true
+udevadm settle
 
-    sgdisk -Z "$DISK" >/dev/null
-    sgdisk -n 1:0:+1G -t 1:ef00 -c 1:"EFI" "$DISK" >/dev/null
-    sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK" >/dev/null
-    udevadm settle; sleep 2
+if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
+    PART_EFI="${DISK}p1"
+    PART_ROOT="${DISK}p2"
+else
+    PART_EFI="${DISK}1"
+    PART_ROOT="${DISK}2"
+fi
 
-    local pfx=""; [[ "$DISK" =~ [0-9]$ ]] && pfx="p"
-    local part_efi="${DISK}${pfx}1"; local part_root="${DISK}${pfx}2"
+# --- 6. LUKS Y SISTEMAS DE ARCHIVOS ---
+echo "[*] Formateando e iniciando LUKS..."
+mkfs.fat -F 32 "$PART_EFI" || { echo "[!] Fallo al formatear partición EFI"; exit 1; }
 
-    mkfs.fat -F32 -n EFI "$part_efi" >/dev/null
+echo -n "$PASSWORD" | cryptsetup luksFormat --type luks2 "$PART_ROOT" - || { echo "[!] Fallo en luksFormat"; exit 1; }
+echo -n "$PASSWORD" | cryptsetup open "$PART_ROOT" "$CRYPT_NAME" - || { echo "[!] Fallo al abrir contenedor LUKS"; exit 1; }
 
-    local mapper_dev="$part_root"
-    if [ "$LUKS_OPT" -eq 1 ]; then
-        log_info "Configurando LUKS2..."
-        printf '%s' "$LUKS_PASS" | cryptsetup -q luksFormat --type luks2 "$part_root" -
-        printf '%s' "$LUKS_PASS" | cryptsetup open "$part_root" cryptroot - || die "Fallo LUKS open."
-        cryptsetup luksDump "$part_root" >/dev/null || die "Cabecera LUKS corrupta."
-        mapper_dev="/dev/mapper/cryptroot"
-        ROOT_UUID=$(blkid -s UUID -o value "$part_root")
-    fi
+# 6: Verificación LUKS
+if [ ! -b "/dev/mapper/$CRYPT_NAME" ]; then
+    echo "[!] Error Crítico: /dev/mapper/$CRYPT_NAME no se creó correctamente."
+    exit 1
+fi
 
-    mkfs.btrfs -f -L ArchCachy "$mapper_dev" >/dev/null
-    safe_mount "$mapper_dev" /mnt
-    
-    for sv in @ @home @log @pkg @snapshots; do btrfs subvolume create "/mnt/${sv}" >/dev/null; done
-    umount /mnt
+echo "[*] Formateando BTRFS y montando..."
+mkfs.btrfs -f -L ICEMAN_ROOT "/dev/mapper/$CRYPT_NAME" || { echo "[!] Fallo al formatear BTRFS"; exit 1; }
+mount "/dev/mapper/$CRYPT_NAME" /mnt
 
-    local opts="noatime,compress=zstd:1,space_cache=v2"
-    [ "$IS_SSD" -eq 1 ] && opts="${opts},discard=async"
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@var_log
+btrfs subvolume create /mnt/@cache
+umount /mnt
 
-    safe_mount -o "${opts},subvol=@" "$mapper_dev" /mnt
-    mkdir -p /mnt/{home,var/log,var/cache/pacman/pkg,.snapshots,boot/efi,tmp}
-    
-    safe_mount -o "${opts},subvol=@home" "$mapper_dev" /mnt/home
-    safe_mount -o "${opts},subvol=@log" "$mapper_dev" /mnt/var/log
-    safe_mount -o "${opts},subvol=@pkg" "$mapper_dev" /mnt/var/cache/pacman/pkg
-    safe_mount -o "${opts},subvol=@snapshots" "$mapper_dev" /mnt/.snapshots
-    safe_mount "$part_efi" /mnt/boot/efi
+DISC_TYPE=$(lsblk -d -n -o ROTA "$DISK" 2>/dev/null || echo "1")
+BTRFS_OPTS="rw,noatime,compress=zstd:1"
+if [[ "$DISC_TYPE" == "0" ]]; then
+    echo "[*] Disco Sólido (SSD/NVMe) detectado. Habilitando discard=async."
+    BTRFS_OPTS+=",discard=async"
+else
+    echo "[*] Disco Mecánico (HDD) detectado. Omitiendo discard."
+fi
 
-    BLOCK_TIMES["Discos"]=$((SECONDS - t0))
-}
+mount -o subvol=@,"$BTRFS_OPTS" "/dev/mapper/$CRYPT_NAME" /mnt
+mkdir -p /mnt/{boot/efi,home,.snapshots,var/log,var/cache}
 
-# ------------------------------------------------------------------------------
-# 8. FASE 2 & 3: PACSTRAP
-# ------------------------------------------------------------------------------
-install_base() {
-    local t0=$SECONDS
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Pacstrap"
+mount -o subvol=@home,"$BTRFS_OPTS" "/dev/mapper/$CRYPT_NAME" /mnt/home
+mount -o subvol=@snapshots,"$BTRFS_OPTS" "/dev/mapper/$CRYPT_NAME" /mnt/.snapshots
+mount -o subvol=@var_log,"$BTRFS_OPTS" "/dev/mapper/$CRYPT_NAME" /mnt/var/log
+mount -o subvol=@cache,"$BTRFS_OPTS" "/dev/mapper/$CRYPT_NAME" /mnt/var/cache
+mount "$PART_EFI" /mnt/boot/efi
 
-    local pkgs=(base base-devel linux-cachyos linux-cachyos-headers linux-firmware 
-                cachyos-keyring cachyos-hooks cachyos-settings btrfs-progs grub efibootmgr 
-                networkmanager sudo git curl sbctl snapper snap-pac grub-btrfs btrfs-assistant)
+echo "[*] Verificando montajes de BTRFS y EFI..."
+for mp in /mnt /mnt/home /mnt/.snapshots /mnt/var/log /mnt/var/cache /mnt/boot/efi; do
+    mountpoint -q "$mp" || { echo "[!] Error Crítico: Falló el montaje de $mp"; exit 1; }
+done
 
-    # Microcode estricto excluyente
-    if [ "$CPU_VENDOR" == "AMD" ]; then pkgs+=(amd-ucode);
-    elif [ "$CPU_VENDOR" == "INTEL" ]; then pkgs+=(intel-ucode); fi
+# --- 7. EXPORTACIÓN DE VARIABLES SEGURAS ---
+# 5: Verificación estricta de UUID LUKS
+LUKS_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+if [ -z "$LUKS_UUID" ]; then
+    echo "[!] Error Crítico: blkid no pudo recuperar el UUID de $PART_ROOT."
+    exit 1
+fi
 
-    [ "$GPU_VENDOR" == "AMD" ] && pkgs+=(mesa xf86-video-amdgpu vulkan-radeon corectrl)
-    [ "$GPU_VENDOR" == "INTEL" ] && pkgs+=(mesa intel-media-driver vulkan-intel)
-    [ "$GPU_VENDOR" == "NVIDIA" ] && pkgs+=(nvidia-dkms nvidia-utils)
-
-    [ "$HAS_BLUETOOTH" -eq 1 ] && pkgs+=(bluez bluez-utils)
-    [ "$VIRT_TYPE" == "kvm" ] && pkgs+=(qemu-guest-agent)
-
-    if [ "$DESKTOP" == "GNOME" ]; then pkgs+=(gnome gnome-tweaks gdm xdg-desktop-portal-gnome)
-    elif [ "$DESKTOP" == "KDE" ]; then pkgs+=(plasma-meta dolphin sddm xdg-desktop-portal-kde); fi
-
-    retry_cmd "pacstrap -K /mnt ${pkgs[*]}" || die "Pacstrap falló."
-    genfstab -U /mnt | grep -v 'tmpfs' > /mnt/etc/fstab
-
-    BLOCK_TIMES["Pacstrap"]=$((SECONDS - t0))
-}
-
-# ------------------------------------------------------------------------------
-# 9. FASE 1 & 4: CONFIGURACIÓN CHROOT
-# ------------------------------------------------------------------------------
-configure_chroot() {
-    local t0=$SECONDS
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Chroot y Configuración"
-
-    local dm_srv=""; [ "$DESKTOP" == "GNOME" ] && dm_srv="gdm"; [ "$DESKTOP" == "KDE" ] && dm_srv="sddm"
-
-    cat > /mnt/tmp/vars.sh <<EOF
-export TIMEZONE="${TIMEZONE}" LOCALE_NAME="${LOCALE_NAME}" KEYMAP="${KEYMAP}"
-export HOSTNAME_DEF="${HOSTNAME_DEF}" USER_NAME="${USER_NAME}" PASSWORD="${PASSWORD}"
-export LUKS_OPT=${LUKS_OPT} ROOT_UUID="${ROOT_UUID}" HAS_INTERNET_AUR=${HAS_INTERNET_AUR}
-export IS_SSD=${IS_SSD} HAS_BLUETOOTH=${HAS_BLUETOOTH} VIRT_TYPE="${VIRT_TYPE}" DM_SERVICE="${dm_srv}"
+# A: NO exportamos PASSWORD al disco.
+cat <<EOF> /mnt/vars.sh
+#!/usr/bin/env bash
+export HOSTNAME="$HOSTNAME"
+export USERNAME="$USERNAME"
+export LUKS_UUID="$LUKS_UUID"
+export CRYPT_NAME="$CRYPT_NAME"
+export DISPLAY_MANAGER="$DISPLAY_MANAGER"
 EOF
+chmod +x /mnt/vars.sh
 
-    cat > /mnt/tmp/chroot.sh <<'EOF'
-#!/bin/bash
+# --- 8. INSTALACIÓN BASE Y VERIFICACIÓN FSTAB ---
+echo "[*] Ejecutando pacstrap..."
+# Se incluyen las llaves y repos de CachyOS generados
+declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
+
+retry_cmd pacstrap /mnt "${BASE_PKGS[@]}" "${KERNEL_PKG[@]}" "${HW_PKGS[@]}" "${AUDIO_FONTS[@]}" "${DE_PKGS[@]}"
+
+# Persistencia de CachyOS: Sobrescribir pacman.conf y mirrorlists en la nueva instalación
+echo "[*] Persistiendo repositorios de CachyOS en el nuevo sistema..."
+cp -f /etc/pacman.conf /mnt/etc/pacman.conf
+cp -a /etc/pacman.d/cachyos-v* /mnt/etc/pacman.d/ 2>/dev/null || true
+
+# 3: Verificación de Kernel flexible
+if ! ls /mnt/boot/vmlinuz-* 1> /dev/null 2>&1; then
+    echo "[!] Error Crítico: Imagen del kernel (vmlinuz-*) no encontrada tras pacstrap. Abortando."; exit 1
+fi
+
+echo "[*] Generando fstab..."
+genfstab -U /mnt > /mnt/etc/fstab
+
+# 7: Verificación de fstab
+echo "[*] Auditando fstab..."
+for mnt in "/" "/home" "/.snapshots" "/var/cache" "/var/log" "/boot/efi"; do
+    if ! awk '{print $2}' /mnt/etc/fstab | grep -Fxq "$mnt"; then
+        echo "[!] Error Crítico: Fstab incompleto. Falta entrada para: $mnt"; exit 1
+    fi
+done
+
+# --- 9. SCRIPT CHROOT ---
+cat <<'EOF' > /mnt/chroot.sh
+#!/usr/bin/env bash
 set -Eeuo pipefail
-source /tmp/vars.sh
+IFS=$'\n\t'
 
-ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime; hwclock --systohc
-sed -i "s/^#\?\(${LOCALE_NAME}\)/\1/" /etc/locale.gen; locale-gen >/dev/null
-echo "LANG=${LOCALE_NAME}" > /etc/locale.conf; echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
-echo "${HOSTNAME_DEF}" > /etc/hostname
+# A: El password se lee desde memoria mediante argumento ($1)
+CHROOT_PASS="$1"
+shift
+source /vars.sh
 
-# Idempotencia usuario
-id "${USER_NAME}" >/dev/null 2>&1 || useradd -m -G wheel,video,audio,storage,kvm -s /bin/bash "${USER_NAME}"
-echo "root:${PASSWORD}" | chpasswd; echo "${USER_NAME}:${PASSWORD}" | chpasswd
-echo "%wheel ALL=(ALL:ALL) ALL" > /tmp/10-wheel
-visudo -cf /tmp/10-wheel && install -m440 /tmp/10-wheel /etc/sudoers.d/10-wheel
+echo "[*] Configuración básica..."
+ln -sf /usr/share/zoneinfo/Europe/Madrid /etc/localtime
+hwclock --systohc
+sed -i 's/#es_ES.UTF-8 UTF-8/es_ES.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=es_ES.UTF-8" > /etc/locale.conf
+echo "KEYMAP=es" > /etc/vconsole.conf
+echo "$HOSTNAME" > /etc/hostname
 
-# Hook encrypt (Busybox-based default)
-HOOKS="base udev autodetect microcode modconf kms keyboard keymap consolefont block"
-[ "${LUKS_OPT}" -eq 1 ] && HOOKS="${HOOKS} encrypt"
-HOOKS="${HOOKS} filesystems fsck"
-sed -i "s/^HOOKS=.*/HOOKS=(${HOOKS})/" /etc/mkinitcpio.conf
-mkinitcpio -P >/dev/null || exit 1
+echo "[*] Servicios..."
+systemctl enable NetworkManager
+if [[ -n "$DISPLAY_MANAGER" ]]; then systemctl enable "$DISPLAY_MANAGER"; fi
 
-sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=4/' /etc/default/grub
-cmdline="quiet splash loglevel=3 rd.udev.log_priority=3"
-if [ "${LUKS_OPT}" -eq 1 ]; then
-    cmdline="${cmdline} cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot"
-    sed -i 's/^#GRUB_ENABLE_CRYPTODISK=y/GRUB_ENABLE_CRYPTODISK=y/' /etc/default/grub
-fi
-sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${cmdline}\"|" /etc/default/grub
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchCachy --recheck >/dev/null
-grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1
+echo "[*] Initramfs..."
+sed -i 's/^HOOKS=(.*)/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
+mkinitcpio -P
 
-if sbctl status 2>/dev/null | grep -qi "Setup Mode:.*Enabled"; then
-    sbctl create-keys >/dev/null && sbctl enroll-keys --microsoft >/dev/null
-    for bin in /boot/vmlinuz-linux-cachyos /boot/efi/EFI/ArchCachy/grubx64.efi; do
-        [ -f "$bin" ] && sbctl sign -s "$bin" >/dev/null
-    done
+# 2: Verificación estricta de ambos Initramfs generados
+if ! ls /boot/initramfs-*.img 1> /dev/null 2>&1; then
+    echo "[!] Error Crítico: mkinitcpio no generó el initramfs."; exit 1
 fi
 
-# Snapper Limpio (Sin umounts)
-cp /etc/snapper/config-templates/default /etc/snapper/configs/root
-sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /etc/conf.d/snapper
-sed -i -e 's/^TIMELINE_MIN_AGE=.*/TIMELINE_MIN_AGE="1800"/' \
-       -e 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/' \
-       -e 's/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/' /etc/snapper/configs/root
+echo "[*] Cuentas..."
+echo "root:$CHROOT_PASS" | chpasswd
+if id "$USERNAME" &>/dev/null; then
+    echo "[i] El usuario $USERNAME ya existe. Actualizando contraseña..."
+    echo "$USERNAME:$CHROOT_PASS" | chpasswd
+else
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    echo "$USERNAME:$CHROOT_PASS" | chpasswd
+fi
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-systemctl enable NetworkManager grub-btrfsd snapper-cleanup.timer snapper-timeline.timer >/dev/null 2>&1
-[ -n "${DM_SERVICE}" ] && systemctl enable "${DM_SERVICE}" >/dev/null 2>&1
-[ "${IS_SSD}" -eq 1 ] && systemctl enable fstrim.timer >/dev/null 2>&1
-[ "${HAS_BLUETOOTH}" -eq 1 ] && systemctl enable bluetooth >/dev/null 2>&1
-[ "${VIRT_TYPE}" == "kvm" ] && systemctl enable qemu-guest-agent >/dev/null 2>&1
+# Limpiar memoria de contraseña local del chroot
+unset CHROOT_PASS
+
+id "$USERNAME" &>/dev/null || { echo "[!] Error: El usuario no se creó correctamente."; exit 1; }
+
+echo "[*] Bootloader (GRUB)..."
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"/' /etc/default/grub
+sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=${LUKS_UUID}:${CRYPT_NAME} root=/dev/mapper/${CRYPT_NAME}\"|" /etc/default/grub
+sed -i 's/^#GRUB_ENABLE_CRYPTODISK=y/GRUB_ENABLE_CRYPTODISK=y/' /etc/default/grub
+
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
+
+# 4: Verificación flexible de la ruta de GRUB
+if ! find /boot/efi/EFI -iname "grubx64.efi" | grep -q .; then
+    echo "[!] Error Crítico: grubx64.efi no encontrado en el árbol /boot/efi/EFI/."; exit 1
+fi
+
+# G: Comprobación de grub.cfg
+grub-mkconfig -o /boot/grub/grub.cfg
+grep -q "cryptdevice" /boot/grub/grub.cfg || { echo "[!] Error: Parámetro cryptdevice no aplicado en GRUB."; exit 1; }
+
+echo "[*] Snapper..."
+umount /.snapshots 2>/dev/null || true
+rm -rf /.snapshots 2>/dev/null || true
+
+# 8: Comprobación estricta de configuración de Snapper
+snapper -c root create-config / || { echo "[!] Error Crítico: Falló snapper create-config"; exit 1; }
+if [ ! -f "/etc/snapper/configs/root" ]; then
+    echo "[!] Error Crítico: El archivo /etc/snapper/configs/root no se generó."; exit 1
+fi
+
+btrfs subvolume delete /.snapshots 2>/dev/null || true
+mkdir /.snapshots
+mount -a
+
+mountpoint -q /.snapshots || { echo "[!] Error Crítico: mount -a no montó /.snapshots"; exit 1; }
+chmod 750 /.snapshots
+
+snapper list-configs >/dev/null || { echo "[!] Snapper configs falló."; exit 1; }
+snapper list >/dev/null || { echo "[!] Snapper list falló."; exit 1; }
+
+echo "[*] Secure Boot..."
+sbctl verify 2>/dev/null || echo "[i] Secure Boot no activo/verificable."
+
 EOF
+chmod +x /mnt/chroot.sh
 
-    arch-chroot /mnt bash /tmp/chroot.sh || die "Fallo en Chroot."
-    BLOCK_TIMES["Chroot"]=$((SECONDS - t0))
-}
+# --- 10. EJECUCIÓN DEL CHROOT Y CIERRE ---
+echo "[*] Entrando al chroot..."
+# A: La contraseña se pasa como argumento 1 sin tocar disco y se expurga.
+arch-chroot /mnt /bin/bash /chroot.sh "$PASSWORD"
+unset PASSWORD
 
-# ------------------------------------------------------------------------------
-# 10. FASE 6: VALIDACIÓN ESTRICTA
-# ------------------------------------------------------------------------------
-validate_install() {
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Validación"
-    local c="/mnt" err=0
-    
-    check() { [ -s "$1" ] || { log_error "Fallo validación: $2"; err=1; }; }
-    
-    check "$c/boot/vmlinuz-linux-cachyos" "Kernel"
-    check "$c/boot/efi/EFI/ArchCachy/grubx64.efi" "GRUB EFI"
-    check "$c/etc/fstab" "fstab vacío"
-    
-    [ -x "$c/usr/bin/bash" ] || { log_error "Bash roto"; err=1; }
-    arch-chroot $c lsinitcpio /boot/initramfs-linux-cachyos.img >/dev/null 2>&1 || { log_error "Initramfs corrupto"; err=1; }
-    grep -q "menuentry" $c/boot/grub/grub.cfg || { log_error "GRUB cfg sin entradas"; err=1; }
-    
-    if [ "$LUKS_OPT" -eq 1 ]; then
-        [ -e /dev/mapper/cryptroot ] || { log_error "Mapper LUKS caído"; err=1; }
-        grep -q "cryptdevice" $c/etc/default/grub || { log_error "GRUB sin LUKS config"; err=1; }
-    fi
+echo "[*] Finalizando y limpiando entorno vivo..."
+rm -f /mnt/vars.sh /mnt/chroot.sh
+sync
 
-    arch-chroot $c sbctl status 2>/dev/null | grep -qi "Setup Mode:.*Enabled" && SECURE_BOOT_STATE="Enrolled"
-    [ $err -eq 0 ] || die "El sistema no pasó la validación de integridad."
-}
+# Interrupción del Trap general (éxito)
+trap - EXIT INT TERM ERR
+umount -R /mnt
+cryptsetup close "$CRYPT_NAME"
 
-# ------------------------------------------------------------------------------
-# 11. FASE 7: REPORTES Y LIMPIEZA
-# ------------------------------------------------------------------------------
-generate_report() {
-    ((STEP_COUNT++)); draw_progress $STEP_COUNT $TOTAL_STEPS "Finalizando"
-    
-    cat > "/mnt$JSON_LOG" <<EOF
-{
-    "version": "${ICEMAN_VERSION}", "time_seconds": $((SECONDS - START_TIME)),
-    "hardware": { "cpu": "${CPU_VENDOR}", "gpu": "${GPU_VENDOR}", "is_ssd": $([ "$IS_SSD" -eq 1 ] && echo true || echo false) },
-    "config": { "desktop": "${DESKTOP}", "luks_enabled": $([ "$LUKS_OPT" -eq 1 ] && echo true || echo false) }
-}
-EOF
-    cp "$LOG_FILE" /mnt/var/log/iceman_install.log 2>/dev/null || true
-    PASSWORD=""; LUKS_PASS=""; rm -f /mnt/tmp/vars.sh /mnt/tmp/chroot.sh 2>/dev/null || true
-    INSTALL_SUCCESS=1
-}
-
-main() {
-    clear; echo -e "${C_BLU}== ICEMAN INSTALLER V3.1 ENTERPRISE ==${C_NC}"
-    user_input; detect_hardware; configure_pacman
-    prepare_disk; install_base; configure_chroot
-    validate_install; generate_report
-
-    echo -e "\n${C_GRE}✔ INSTALACIÓN COMPLETADA${C_NC}\n Tiempos por Bloque:"
-    for k in "${!BLOCK_TIMES[@]}"; do printf "  - %-10s : %02dm %02ds\n" "$k" $((BLOCK_TIMES[$k]%3600/60)) $((BLOCK_TIMES[$k]%60)); done
-    printf "  - %-10s : %02dm %02ds\n\n" "TOTAL" $(((SECONDS-START_TIME)%3600/60)) $(((SECONDS-START_TIME)%60))
-}
-main "$@"
+echo "========================================================"
+echo " ICEMAN COMPLETADO CON ÉXITO Y AUDITORÍA APROBADA.      "
+echo "========================================================"
