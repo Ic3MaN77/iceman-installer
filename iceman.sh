@@ -8,6 +8,10 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Inicialización de entorno temporal
+WORK_DIR=$(mktemp -d)
+export WORK_DIR
+
 # --- 0. FUNCIONES GLOBALES Y TRAP DE LIMPIEZA ---
 cleanup() {
     local exit_code=$?
@@ -16,24 +20,28 @@ cleanup() {
         swapoff -a 2>/dev/null || true
         umount -R /mnt 2>/dev/null || true
         cryptsetup close "cryptroot" 2>/dev/null || true
-        echo "[i] Limpieza completada. El sistema anfitrión se mantiene intacto."
+        echo "[i] Limpieza de montajes y volúmenes completada."
+    fi
+    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+        echo "[i] Limpieza de entorno temporal ($WORK_DIR) completada."
     fi
     exit $exit_code
 }
 trap cleanup EXIT INT TERM ERR
 
-# Reintento con backoff exponencial (2s, 4s, 8s)
+# Reintento con backoff exponencial exclusivo para RED (2s, 4s, 8s)
 retry_cmd() {
     local n=1 max=3 delay=2
     while true; do
         if "$@"; then return 0; fi
         if (( n < max )); then
-            echo "[!] Comando '$1' falló. Reintentando en ${delay}s ($n/$max)..."
+            echo "[!] Comando de red '$1' falló. Reintentando en ${delay}s ($n/$max)..."
             sleep "$delay"
             ((n++))
             ((delay *= 2))
         else
-            echo "[!] Error crítico tras $max intentos: $*"
+            echo "[!] Error crítico de red tras $max intentos: $*"
             return 1
         fi
     done
@@ -48,11 +56,10 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Eliminados bootctl y sbctl de obligatorios (ahora condicionales en tiempo de ejecución)
 declare -a REQ_TOOLS=("pacstrap" "arch-chroot" "cryptsetup" "sgdisk" "mkfs.btrfs" "mkfs.fat" "btrfs" "blkid" "curl" "tar" "lsblk" "lspci")
 for tool in "${REQ_TOOLS[@]}"; do
     if ! command -v "$tool" &>/dev/null; then
-        echo "[!] Error Crítico: Herramienta necesaria '$tool' no encontrada. ¿Estás en una ISO Live de Arch?"
+        echo "[!] Error Crítico: Herramienta necesaria '$tool' no encontrada."
         exit 1
     fi
 done
@@ -62,13 +69,12 @@ if [ ! -d "/sys/firmware/efi" ]; then
     exit 1
 fi
 
-# Comprobación de red vía HTTPS con curl (--fail evita falsos positivos en 404/500)
-if ! curl -Isf --connect-timeout 5 https://archlinux.org &>/dev/null; then
+# Blindaje de curl para comprobación de red
+if ! curl --fail --location --silent --show-error --connect-timeout 5 https://archlinux.org &>/dev/null; then
     echo "[!] Error Crítico: No hay conexión a Internet (HTTPS). Abortando."
     exit 1
 fi
 
-# Detección temprana y segura de Secure Boot (con comprobación de existencia de bootctl)
 echo -e "\n[*] Verificando estado de Secure Boot..."
 if command -v bootctl >/dev/null 2>&1; then
     if bootctl status 2>/dev/null | grep -iq "Secure Boot: enabled"; then
@@ -77,7 +83,7 @@ if command -v bootctl >/dev/null 2>&1; then
         echo "    -> [INFO] Secure Boot está DESHABILITADO."
     fi
 else
-    echo "    -> [INFO] Herramienta bootctl no disponible en la ISO actual. Omitiendo verificación previa."
+    echo "    -> [INFO] Herramienta bootctl no disponible. Omitiendo verificación previa."
 fi
 
 # --- 2. ASISTENTE INTERACTIVO DE CONFIGURACIÓN ---
@@ -93,14 +99,18 @@ echo "--------------------------------------------------------"
 read -p "[?] Introduce el disco objetivo (ej: /dev/nvme0n1 o /dev/sda): " DISK </dev/tty
 if [ ! -b "$DISK" ]; then echo "[!] El dispositivo $DISK no existe."; exit 1; fi
 
+# Protección para evitar sobrescribir el medio de instalación (Live USB/ISO)
+if lsblk "$DISK" -n -o MOUNTPOINT 2>/dev/null | grep -qE "^/run/archiso|^/run/miso|^/run/initramfs"; then
+    echo "[!] Error Crítico: El disco seleccionado ($DISK) está en uso como medio Live. No puedes instalar sobre él."
+    exit 1
+fi
+
 read -p "[?] ¿Deseas cifrar el disco con LUKS? (s/N): " USE_LUKS_INPUT </dev/tty
 USE_LUKS_INPUT=${USE_LUKS_INPUT:-n}
 if [[ "${USE_LUKS_INPUT,,}" == "s" || "${USE_LUKS_INPUT,,}" == "si" ]]; then
-    ENABLE_LUKS=true
-    echo "    -> Cifrado LUKS: ACTIVADO"
+    ENABLE_LUKS=true; echo "    -> Cifrado LUKS: ACTIVADO"
 else
-    ENABLE_LUKS=false
-    echo "    -> Cifrado LUKS: DESACTIVADO"
+    ENABLE_LUKS=false; echo "    -> Cifrado LUKS: DESACTIVADO"
 fi
 
 read -p "[?] Nombre de usuario [iceman]: " USERNAME </dev/tty
@@ -135,86 +145,92 @@ declare -a HW_PKGS=()
 declare -a DE_PKGS=()
 declare -a AUDIO_FONTS=("pipewire" "pipewire-pulse" "pipewire-alsa" "pipewire-jack" "wireplumber" "bluez" "bluez-utils" "ttf-dejavu" "ttf-liberation" "noto-fonts")
 
-# --- 3. INYECCIÓN DE CACHYOS Y FAIL-FAST (Con mktemp dinámico) ---
-echo "[*] Preparando repositorios y firmas de CachyOS..."
-WORK_DIR=$(mktemp -d)
-cd "$WORK_DIR"
+# --- 3. INYECCIÓN NATIVA DE REPOSITORIOS CACHYOS ---
+echo "[*] Inyectando repositorios de CachyOS de forma nativa..."
+cp /etc/pacman.conf /etc/pacman.conf.bak
 
-# Descarga resiliente
-retry_cmd curl -sLOf https://mirror.cachyos.org/cachyos-repo.tar.xz
+# Configuración temporal para evadir comprobación de firmas al descargar el keyring original
+cat <<EOF >> /etc/pacman.conf
 
-# Verificación de integridad del tarball antes de extraer
-if ! tar -tf cachyos-repo.tar.xz >/dev/null 2>&1; then
-    echo "[!] Error Crítico: El tarball cachyos-repo.tar.xz está corrupto."
-    rm -rf "$WORK_DIR"
-    exit 1
-fi
+[cachyos]
+SigLevel = Never
+Server = https://mirror.cachyos.org/repo/\$arch/\$repo
+EOF
 
-tar xf cachyos-repo.tar.xz || { rm -rf "$WORK_DIR"; exit 1; }
-cd cachyos-repo
-
-# Ejecución del script de CachyOS protegida con reintento (por si falla la red al obtener GPG)
-retry_cmd ./cachyos-repo.sh || {
-    echo "[!] Error Crítico: Fallo al instalar las firmas/repos de CachyOS."
-    cd /
-    rm -rf "$WORK_DIR"
+echo "    -> Descargando keyring y mirrorlist (Fase 1)..."
+retry_cmd pacman -Sy --noconfirm cachyos-keyring cachyos-mirrorlist || {
+    echo "[!] Error Crítico: Fallo al descargar keyring/mirrorlist de CachyOS."
+    mv /etc/pacman.conf.bak /etc/pacman.conf
     exit 1
 }
-cd /
-rm -rf "$WORK_DIR"
 
-# Fail-Fast: Validación contra base de datos oficial
+echo "    -> Restaurando seguridad y configurando jerarquía (Fase 2)..."
+mv /etc/pacman.conf.bak /etc/pacman.conf
+
+# Determinando soporte de arquitectura x86_64-v3 para máxima optimización
+if /lib/ld-linux-x86-64.so.2 --help | grep -q "x86_64-v3 (supported, searched)"; then
+    echo "    -> [INFO] CPU compatible con x86_64-v3. Habilitando repositorios optimizados."
+    cat <<EOF >> /etc/pacman.conf
+
+[cachyos-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-core-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-extra-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+EOF
+fi
+
+# Repositorio genérico base siempre incluido
+cat <<EOF >> /etc/pacman.conf
+
+[cachyos]
+Include = /etc/pacman.d/cachyos-mirrorlist
+EOF
+
+echo "    -> Inicializando e importando llaves pacman..."
+retry_cmd pacman-key --init
+retry_cmd pacman-key --populate cachyos
+
 echo "[*] Verificando la inyección del repositorio en base de datos (Fail-Fast)..."
 retry_cmd pacman -Sy --noconfirm
-if ! pacman -Si linux-cachyos >/dev/null 2>&1 || ! grep -q -i "cachyos" /etc/pacman.conf; then
-    echo "[!] Error Crítico: La inyección de CachyOS falló o el paquete no existe."
-    echo "[!] Abortando el script. El disco duro anfitrión no ha sido alterado."
+if ! pacman -Si linux-cachyos >/dev/null 2>&1; then
+    echo "[!] Error Crítico: La inyección nativa de CachyOS falló o el paquete no existe."
     exit 1
 fi
-echo "    -> Repositorios validados correctamente."
+echo "    -> Repositorios inyectados y validados correctamente."
 
 if command -v reflector &>/dev/null; then
-    echo "[*] Optimizando espejos con Reflector..."
+    echo "[*] Optimizando espejos base con Reflector..."
     retry_cmd reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || echo "[i] Reflector omitido."
 fi
-
 retry_cmd pacman -Syy --noconfirm
 
-# --- 4. AUDITORÍA Y DETECCIÓN DE HARDWARE COMPLETA ---
+# --- 4. AUDITORÍA Y DETECCIÓN DE HARDWARE ---
 echo "[*] Auditando componentes del sistema..."
 
 if command -v systemd-detect-virt &>/dev/null; then
     VIRT=$(systemd-detect-virt || true)
-    if [[ "$VIRT" == "kvm" || "$VIRT" == "qemu" ]]; then
-        HW_PKGS+=("qemu-guest-agent")
-        echo "    -> [VM] QEMU/KVM detectado."
-    elif [[ "$VIRT" == "oracle" ]]; then
-        HW_PKGS+=("virtualbox-guest-utils-nox")
-        echo "    -> [VM] VirtualBox detectado."
+    if [[ "$VIRT" == "kvm" || "$VIRT" == "qemu" ]]; then HW_PKGS+=("qemu-guest-agent"); echo "    -> [VM] QEMU/KVM detectado."
+    elif [[ "$VIRT" == "oracle" ]]; then HW_PKGS+=("virtualbox-guest-utils-nox"); echo "    -> [VM] VirtualBox detectado."
     fi
 fi
 
-if grep -q "AuthenticAMD" /proc/cpuinfo; then 
-    HW_PKGS+=("amd-ucode")
-    echo "    -> [CPU] AMD detectada."
-elif grep -q "GenuineIntel" /proc/cpuinfo; then 
-    HW_PKGS+=("intel-ucode")
-    echo "    -> [CPU] Intel detectada."
+if grep -q "AuthenticAMD" /proc/cpuinfo; then HW_PKGS+=("amd-ucode"); echo "    -> [CPU] AMD detectada."
+elif grep -q "GenuineIntel" /proc/cpuinfo; then HW_PKGS+=("intel-ucode"); echo "    -> [CPU] Intel detectada."
 fi
 
-if lspci | grep -iE "vga.*nvidia|3d.*nvidia" &> /dev/null; then 
-    HW_PKGS+=("nvidia-dkms" "nvidia-utils")
-    echo "    -> [GPU] NVIDIA detectada."
+if lspci -nnk | grep -iA 2 -E "VGA|3D|Display" | grep -iq "nvidia"; then 
+    HW_PKGS+=("nvidia-dkms" "nvidia-utils"); echo "    -> [GPU] NVIDIA detectada."
 fi
 
-if lspci | grep -iE "vga.*(amd|ati)|3d.*(amd|ati)" &> /dev/null; then 
-    HW_PKGS+=("mesa" "lib32-mesa" "vulkan-radeon" "lib32-vulkan-radeon" "libva-mesa-driver" "mesa-vdpau")
-    echo "    -> [GPU] AMD/ATI detectada."
+# Detección refinada de AMD/ATI mediante módulos del kernel
+if lspci -nnk | grep -iA 2 -E "VGA|3D|Display" | grep -iqE "amdgpu|radeon"; then 
+    HW_PKGS+=("mesa" "lib32-mesa" "vulkan-radeon" "lib32-vulkan-radeon" "libva-mesa-driver" "mesa-vdpau"); echo "    -> [GPU] AMD/ATI detectada."
 fi
 
-if lspci | grep -iE "vga.*intel|3d.*intel" &> /dev/null; then 
-    HW_PKGS+=("mesa" "intel-media-driver" "vulkan-intel")
-    echo "    -> [GPU] Intel detectada."
+if lspci -nnk | grep -iA 2 -E "VGA|3D|Display" | grep -iq "intel"; then 
+    HW_PKGS+=("mesa" "intel-media-driver" "vulkan-intel"); echo "    -> [GPU] Intel detectada."
 fi
 
 DISPLAY_MANAGER=""
@@ -236,28 +252,30 @@ sgdisk -n 2:0:0   -t 2:8300 -c 2:"ROOT" "$DISK"
 
 partprobe "$DISK" || true
 udevadm settle
+sleep 2
 
 if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
-    PART_EFI="${DISK}p1"
-    PART_ROOT="${DISK}p2"
+    PART_EFI="${DISK}p1"; PART_ROOT="${DISK}p2"
 else
-    PART_EFI="${DISK}1"
-    PART_ROOT="${DISK}2"
+    PART_EFI="${DISK}1"; PART_ROOT="${DISK}2"
+fi
+
+echo "[*] Verificando existencia de particiones..."
+if ! lsblk "$PART_EFI" >/dev/null 2>&1 || ! lsblk "$PART_ROOT" >/dev/null 2>&1; then
+    echo "[!] Error Crítico: Las particiones no se crearon o udev no las ha expuesto."; exit 1
 fi
 
 echo "[*] Formateando partición EFI..."
-mkfs.fat -F 32 "$PART_EFI" || { echo "[!] Fallo al formatear partición EFI"; exit 1; }
+mkfs.fat -F 32 "$PART_EFI" >/dev/null
+blkid -p -u filesystem "$PART_EFI" | grep -iq "vfat" || { echo "[!] Error: Fallo real al crear sistema vfat."; exit 1; }
 
 TARGET_BTRFS_DEV=""
-
 if [ "$ENABLE_LUKS" = true ]; then
     echo "[*] Configurando contenedor cifrado LUKS2..."
     echo -n "$PASSWORD" | cryptsetup luksFormat --type luks2 "$PART_ROOT" - || { echo "[!] Fallo en luksFormat"; exit 1; }
     echo -n "$PASSWORD" | cryptsetup open "$PART_ROOT" "$CRYPT_NAME" - || { echo "[!] Fallo al abrir LUKS"; exit 1; }
     
-    if [ ! -b "/dev/mapper/$CRYPT_NAME" ]; then
-        echo "[!] Error Crítico: /dev/mapper/$CRYPT_NAME no existe."; exit 1
-    fi
+    if [ ! -b "/dev/mapper/$CRYPT_NAME" ]; then echo "[!] Error Crítico: /dev/mapper/$CRYPT_NAME no existe."; exit 1; fi
     TARGET_BTRFS_DEV="/dev/mapper/$CRYPT_NAME"
 else
     echo "[*] Saltando LUKS. Instalación nativa..."
@@ -265,7 +283,9 @@ else
 fi
 
 echo "[*] Formateando BTRFS..."
-mkfs.btrfs -f -L ICEMAN_ROOT "$TARGET_BTRFS_DEV" || exit 1
+mkfs.btrfs -f -L ICEMAN_ROOT "$TARGET_BTRFS_DEV" >/dev/null
+blkid -p -u filesystem "$TARGET_BTRFS_DEV" | grep -iq "btrfs" || { echo "[!] Error: Fallo real al crear sistema btrfs."; exit 1; }
+
 mount "$TARGET_BTRFS_DEV" /mnt
 
 echo "[*] Creando subvolúmenes BTRFS..."
@@ -278,9 +298,7 @@ umount /mnt
 
 DISC_TYPE=$(lsblk -d -n -o ROTA "$DISK" 2>/dev/null || echo "1")
 BTRFS_OPTS="rw,noatime,compress=zstd:1"
-if [[ "$DISC_TYPE" == "0" ]]; then
-    BTRFS_OPTS+=",discard=async"
-fi
+if [[ "$DISC_TYPE" == "0" ]]; then BTRFS_OPTS+=",discard=async"; fi
 
 mount -o subvol=@,"$BTRFS_OPTS" "$TARGET_BTRFS_DEV" /mnt
 mkdir -p /mnt/{boot/efi,home,.snapshots,var/log,var/cache}
@@ -291,7 +309,6 @@ mount -o subvol=@var_log,"$BTRFS_OPTS" "$TARGET_BTRFS_DEV" /mnt/var/log
 mount -o subvol=@cache,"$BTRFS_OPTS" "$TARGET_BTRFS_DEV" /mnt/var/cache
 mount "$PART_EFI" /mnt/boot/efi
 
-# RECUPERACIÓN: Verificación estricta de todos los montajes
 echo "[*] Verificando montajes de subvolúmenes..."
 for mp in /mnt /mnt/home /mnt/.snapshots /mnt/var/log /mnt/var/cache /mnt/boot/efi; do
     mountpoint -q "$mp" || { echo "[!] Error Crítico: El punto de montaje $mp no está activo."; exit 1; }
@@ -301,9 +318,7 @@ done
 LUKS_UUID=""
 if [ "$ENABLE_LUKS" = true ]; then
     LUKS_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-    if [ -z "$LUKS_UUID" ]; then
-        echo "[!] Error Crítico: No se pudo obtener UUID de $PART_ROOT."; exit 1
-    fi
+    if [ -z "$LUKS_UUID" ]; then echo "[!] Error Crítico: No se pudo obtener UUID de $PART_ROOT."; exit 1; fi
 fi
 
 cat <<EOF> /mnt/vars.sh
@@ -321,28 +336,27 @@ EOF
 chmod +x /mnt/vars.sh
 
 # --- 7. INSTALACIÓN BASE Y CONFIGURACIÓN FSTAB ---
-echo "[*] Ejecutando pacstrap..."
+echo "[*] Ejecutando pacstrap (Sin reintentos)..."
 declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
 
-retry_cmd pacstrap /mnt "${BASE_PKGS[@]}" "${KERNEL_PKG[@]}" "${HW_PKGS[@]}" "${AUDIO_FONTS[@]}" "${DE_PKGS[@]}"
+pacstrap /mnt "${BASE_PKGS[@]}" "${KERNEL_PKG[@]}" "${HW_PKGS[@]}" "${AUDIO_FONTS[@]}" "${DE_PKGS[@]}" || { echo "[!] Error Crítico: pacstrap falló."; exit 1; }
 
-# RECUPERACIÓN: Comprobación post-pacstrap del entorno base
 if [ ! -d "/mnt/etc" ] || [ ! -x "/mnt/usr/bin/bash" ]; then
-    echo "[!] Error Crítico: pacstrap no completó la instalación correctamente (/mnt/etc o bash ausentes)."; exit 1
+    echo "[!] Error Crítico: pacstrap no completó la instalación correctamente."; exit 1
 fi
 
 echo "[*] Persistiendo configuración completa de repositorios..."
 cp -f /etc/pacman.conf /mnt/etc/pacman.conf
-cp -a /etc/pacman.d/. /mnt/etc/pacman.d/ 2>/dev/null || true
+# Copiamos de forma estricta solo los espejos de configuración
+cp -f /etc/pacman.d/*mirrorlist* /mnt/etc/pacman.d/ 2>/dev/null || true
 
 if [ ! -f "/mnt/boot/vmlinuz-linux-cachyos" ]; then
     echo "[!] Error Crítico: vmlinuz-linux-cachyos no encontrado tras pacstrap."; exit 1
 fi
 
 echo "[*] Generando y auditando fstab..."
-genfstab -U /mnt > /mnt/etc/fstab
+genfstab -U /mnt > /mnt/etc/fstab || { echo "[!] Error Crítico: genfstab falló."; exit 1; }
 
-# RECUPERACIÓN: Auditoría estricta de fstab
 for mnt in "/" "/home" "/.snapshots" "/var/cache" "/var/log" "/boot/efi"; do
     if ! awk '{print $2}' /mnt/etc/fstab | grep -Fxq "$mnt"; then
         echo "[!] Error Crítico: El fstab generado no contiene el punto de montaje obligatorio: $mnt"; exit 1
@@ -354,22 +368,6 @@ cat <<'EOF' > /mnt/chroot.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
 IFS=$'\n\t'
-
-retry_cmd() {
-    local n=1 max=3 delay=2
-    while true; do
-        if "$@"; then return 0; fi
-        if (( n < max )); then
-            echo "[!] Comando '$1' falló. Reintentando en ${delay}s ($n/$max)..."
-            sleep "$delay"
-            ((n++))
-            ((delay *= 2))
-        else
-            echo "[!] Error crítico tras $max intentos: $*"
-            return 1
-        fi
-    done
-}
 
 CHROOT_PASS="$1"
 shift
@@ -390,14 +388,14 @@ systemctl enable NetworkManager
 systemctl enable bluetooth
 if [[ -n "$DISPLAY_MANAGER" ]]; then systemctl enable "$DISPLAY_MANAGER"; fi
 
-echo "[*] Configurando Initramfs..."
+echo "[*] Configurando Initramfs (Edición Regex robusta)..."
 if [ "$ENABLE_LUKS" = true ]; then
-    sed -i 's/^HOOKS=(.*)/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*HOOKS=.*$/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 else
-    sed -i 's/^HOOKS=(.*)/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block btrfs filesystems fsck)/' /etc/mkinitcpio.conf
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*HOOKS=.*$/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 fi
 
-retry_cmd mkinitcpio -P
+mkinitcpio -P || { echo "[!] Error Crítico: Fallo al generar el initramfs."; exit 1; }
 
 if [ ! -f "/boot/initramfs-linux-cachyos.img" ]; then
     echo "[!] Error Crítico: initramfs-linux-cachyos.img no ha sido generado."; exit 1
@@ -424,16 +422,14 @@ else
     sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=""|' /etc/default/grub
 fi
 
-retry_cmd grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || { echo "[!] Error Crítico: grub-install falló."; exit 1; }
 
-# RECUPERACIÓN: Verificación de binario GRUB en EFI
 if ! find /boot/efi/EFI -iname "grubx64.efi" | grep -q .; then
     echo "[!] Error Crítico: grubx64.efi no se encuentra en la partición EFI."; exit 1
 fi
 
-grub-mkconfig -o /boot/grub/grub.cfg
+grub-mkconfig -o /boot/grub/grub.cfg || { echo "[!] Error Crítico: grub-mkconfig falló."; exit 1; }
 
-# RECUPERACIÓN: Verificación de parámetro cryptdevice en grub.cfg si LUKS está activo
 if [ "$ENABLE_LUKS" = true ]; then
     grep -q "cryptdevice" /boot/grub/grub.cfg || { echo "[!] Error: El parámetro cryptdevice no se aplicó en grub.cfg."; exit 1; }
 fi
@@ -443,21 +439,20 @@ umount /.snapshots 2>/dev/null || true
 rm -rf /.snapshots 2>/dev/null || true
 snapper -c root create-config / || exit 1
 
-# RECUPERACIÓN: Verificación de creación de configuración de snapper
 if [ ! -f "/etc/snapper/configs/root" ]; then
     echo "[!] Error: Configuración de Snapper no generada en /etc/snapper/configs/root."; exit 1
 fi
 
 btrfs subvolume delete /.snapshots 2>/dev/null || true
-mkdir /.snapshots
-mount -a
-mountpoint -q /.snapshots || { echo "[!] Error: /.snapshots no está montado correctamente."; exit 1; }
+mkdir -p /.snapshots
+# Montaje explícito sin recurrir a 'mount -a'
+mount /.snapshots || { echo "[!] Error: Fallo al montar /.snapshots."; exit 1; }
+sync
 chmod 750 /.snapshots
 
 systemctl enable snapper-timeline.timer
 systemctl enable snapper-cleanup.timer
 
-# RECUPERACIÓN: Validación de estado de configuraciones de snapper
 snapper list-configs >/dev/null || { echo "[!] Error: snapper list-configs ha fallado."; exit 1; }
 
 echo "[*] Verificando Secure Boot final..."
@@ -469,11 +464,15 @@ chmod +x /mnt/chroot.sh
 
 # --- 9. EJECUCIÓN CHROOT Y LIMPIEZA FINAL ---
 echo "[*] Transfiriendo control al entorno chroot..."
-arch-chroot /mnt /bin/bash /chroot.sh "$PASSWORD"
+
+if ! arch-chroot /mnt /bin/bash /chroot.sh "$PASSWORD"; then
+    echo "[!] Error Crítico: La ejecución dentro de chroot (arch-chroot) falló."
+    exit 1
+fi
+
 unset PASSWORD
 
 echo "[*] Desmontando y finalizando..."
-rm -f /mnt/vars.sh /mnt/chroot.sh
 sync
 
 trap - EXIT INT TERM ERR
@@ -481,6 +480,8 @@ umount -R /mnt
 if [ "$ENABLE_LUKS" = true ]; then
     cryptsetup close "$CRYPT_NAME" 2>/dev/null || true
 fi
+
+if [ -d "$WORK_DIR" ]; then rm -rf "$WORK_DIR"; fi
 
 echo "========================================================"
 echo "   ICEMAN INSTALADO CON ÉXITO Y AUDITORÍA COMPLETA.     "
