@@ -337,7 +337,7 @@ chmod +x /mnt/vars.sh
 
 # --- 7. INSTALACIÓN BASE Y CONFIGURACIÓN FSTAB ---
 echo "[*] Ejecutando pacstrap (Sin reintentos)..."
-declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
+declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "dbus" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
 
 pacstrap /mnt "${BASE_PKGS[@]}" "${KERNEL_PKG[@]}" "${HW_PKGS[@]}" "${AUDIO_FONTS[@]}" "${DE_PKGS[@]}" || { echo "[!] Error Crítico: pacstrap falló."; exit 1; }
 
