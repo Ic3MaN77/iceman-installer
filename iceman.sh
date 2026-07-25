@@ -439,6 +439,12 @@ echo "[*] Configurando Snapper y Timers..."
 umount /.snapshots 2>/dev/null || true
 rm -rf /.snapshots 2>/dev/null || true
 
+echo "[DEBUG] Información de Snapper"
+which snapper
+snapper --version
+pacman -Qi snapper
+ldd "$(which snapper)"
+
 echo "[DEBUG] Ejecutando: snapper create-config"
 snapper -c root create-config /
 echo "[DEBUG] RC snapper create-config = $?"
