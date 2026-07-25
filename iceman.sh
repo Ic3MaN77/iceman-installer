@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ICEMAN - Automated Arch Linux / CachyOS Deployment Script
-# VERSIÓN MONOLÍTICA DEFINITIVA Y BLINDADA - DESATENDIDA Y RESILIENTE
+# VERSIÓN MONOLÍTICA DEFINITIVA - CORRECCIÓN DBUS Y SNAPPER
 # ==============================================================================
 
 # --- ESTÁNDAR MODERNO BASH ---
@@ -337,7 +337,8 @@ chmod +x /mnt/vars.sh
 
 # --- 7. INSTALACIÓN BASE Y CONFIGURACIÓN FSTAB ---
 echo "[*] Ejecutando pacstrap (Sin reintentos)..."
-declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "dbus" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
+# SE AÑADE 'dbus' A LOS PAQUETES BASE PARA RESOLVER EL FALLO DE SNAPPER
+declare -a BASE_PKGS=("base" "base-devel" "linux-firmware" "btrfs-progs" "grub" "efibootmgr" "networkmanager" "dbus" "sudo" "nano" "git" "snapper" "mtools" "dosfstools" "sbctl" "wget" "curl" "mkinitcpio" "cryptsetup" "cachyos-keyring" "cachyos-mirrorlist")
 
 pacstrap /mnt "${BASE_PKGS[@]}" "${KERNEL_PKG[@]}" "${HW_PKGS[@]}" "${AUDIO_FONTS[@]}" "${DE_PKGS[@]}" || { echo "[!] Error Crítico: pacstrap falló."; exit 1; }
 
@@ -347,7 +348,6 @@ fi
 
 echo "[*] Persistiendo configuración completa de repositorios..."
 cp -f /etc/pacman.conf /mnt/etc/pacman.conf
-# Copiamos de forma estricta solo los espejos de configuración
 cp -f /etc/pacman.d/*mirrorlist* /mnt/etc/pacman.d/ 2>/dev/null || true
 
 if [ ! -f "/mnt/boot/vmlinuz-linux-cachyos" ]; then
@@ -435,52 +435,26 @@ if [ "$ENABLE_LUKS" = true ]; then
 fi
 
 echo "[*] Configurando Snapper y Timers..."
-
 umount /.snapshots 2>/dev/null || true
 rm -rf /.snapshots 2>/dev/null || true
-
-echo "[DEBUG] Información de Snapper"
-which snapper
-snapper --version
-pacman -Qi snapper
-ldd "$(which snapper)"
-
-echo "[DEBUG] Ejecutando: snapper create-config"
-snapper -c root create-config /
-echo "[DEBUG] RC snapper create-config = $?"
+snapper -c root create-config / || exit 1
 
 if [ ! -f "/etc/snapper/configs/root" ]; then
-    echo "[!] Error: Configuración de Snapper no generada."
-    exit 1
+    echo "[!] Error: Configuración de Snapper no generada en /etc/snapper/configs/root."; exit 1
 fi
 
-echo "[DEBUG] Eliminando subvolumen antiguo..."
 btrfs subvolume delete /.snapshots 2>/dev/null || true
+mkdir -p /.snapshots
 
-mkdir /.snapshots
-
-echo "[DEBUG] Ejecutando: mount -a"
-mount -a
-echo "[DEBUG] RC mount -a = $?"
-
-mountpoint -q /.snapshots || {
-    echo "[!] Error: /.snapshots no está montado correctamente."
-    exit 1
-}
-
+# Se restaura mount -a confiando en el fstab generado previamente
+mount -a || { echo "[!] Error: Fallo al ejecutar mount -a para /.snapshots."; exit 1; }
+sync
 chmod 750 /.snapshots
 
-echo "[DEBUG] Activando snapper-timeline.timer"
 systemctl enable snapper-timeline.timer
-echo "[DEBUG] RC timeline = $?"
-
-echo "[DEBUG] Activando snapper-cleanup.timer"
 systemctl enable snapper-cleanup.timer
-echo "[DEBUG] RC cleanup = $?"
 
-echo "[DEBUG] Ejecutando: snapper list-configs"
-snapper list-configs
-echo "[DEBUG] RC list-configs = $?"
+snapper list-configs >/dev/null || { echo "[!] Error: snapper list-configs ha fallado."; exit 1; }
 
 echo "[*] Verificando Secure Boot final..."
 if command -v sbctl >/dev/null 2>&1; then
@@ -491,6 +465,12 @@ chmod +x /mnt/chroot.sh
 
 # --- 9. EJECUCIÓN CHROOT Y LIMPIEZA FINAL ---
 echo "[*] Transfiriendo control al entorno chroot..."
+
+# Aseguramos D-Bus vinculando el demonio del sistema anfitrión como respaldo absoluto
+mkdir -p /mnt/run/dbus
+if [ -d /run/dbus ]; then
+    mount --bind /run/dbus /mnt/run/dbus
+fi
 
 if ! arch-chroot /mnt /bin/bash /chroot.sh "$PASSWORD"; then
     echo "[!] Error Crítico: La ejecución dentro de chroot (arch-chroot) falló."
