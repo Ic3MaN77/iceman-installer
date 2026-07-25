@@ -435,25 +435,46 @@ if [ "$ENABLE_LUKS" = true ]; then
 fi
 
 echo "[*] Configurando Snapper y Timers..."
+
 umount /.snapshots 2>/dev/null || true
 rm -rf /.snapshots 2>/dev/null || true
-snapper -c root create-config / || exit 1
+
+echo "[DEBUG] Ejecutando: snapper create-config"
+snapper -c root create-config /
+echo "[DEBUG] RC snapper create-config = $?"
 
 if [ ! -f "/etc/snapper/configs/root" ]; then
-    echo "[!] Error: Configuración de Snapper no generada en /etc/snapper/configs/root."; exit 1
+    echo "[!] Error: Configuración de Snapper no generada."
+    exit 1
 fi
 
+echo "[DEBUG] Eliminando subvolumen antiguo..."
 btrfs subvolume delete /.snapshots 2>/dev/null || true
-mkdir -p /.snapshots
-# Montaje explícito sin recurrir a 'mount -a'
-mount /.snapshots || { echo "[!] Error: Fallo al montar /.snapshots."; exit 1; }
-sync
+
+mkdir /.snapshots
+
+echo "[DEBUG] Ejecutando: mount -a"
+mount -a
+echo "[DEBUG] RC mount -a = $?"
+
+mountpoint -q /.snapshots || {
+    echo "[!] Error: /.snapshots no está montado correctamente."
+    exit 1
+}
+
 chmod 750 /.snapshots
 
+echo "[DEBUG] Activando snapper-timeline.timer"
 systemctl enable snapper-timeline.timer
-systemctl enable snapper-cleanup.timer
+echo "[DEBUG] RC timeline = $?"
 
-snapper list-configs >/dev/null || { echo "[!] Error: snapper list-configs ha fallado."; exit 1; }
+echo "[DEBUG] Activando snapper-cleanup.timer"
+systemctl enable snapper-cleanup.timer
+echo "[DEBUG] RC cleanup = $?"
+
+echo "[DEBUG] Ejecutando: snapper list-configs"
+snapper list-configs
+echo "[DEBUG] RC list-configs = $?"
 
 echo "[*] Verificando Secure Boot final..."
 if command -v sbctl >/dev/null 2>&1; then
